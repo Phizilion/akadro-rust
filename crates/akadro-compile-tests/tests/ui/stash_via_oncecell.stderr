@@ -1,0 +1,28 @@
+error: lifetime may not live long enough
+  --> tests/ui/stash_via_oncecell.rs:16:26
+   |
+14 | impl<'a> Strategy for Leaky<'a> {
+   |      -- lifetime `'a` defined here
+15 |     fn on_bar(&mut self, _bar: Bar, ctx: &mut Ctx<'_>) {
+   |                                     --- has type `&mut Ctx<'1>`
+16 |         if let Some(s) = ctx.closes(InstrumentId::new(0)) {
+   |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ argument requires that `'a` must outlive `'1`
+   |
+   = note: requirement occurs because of the type `Ctx<'_>`, which makes the generic argument `'_` invariant
+   = note: the struct `Ctx<'bar>` is invariant over the parameter `'bar`
+   = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance
+
+error: lifetime may not live long enough
+  --> tests/ui/stash_via_oncecell.rs:17:21
+   |
+14 | impl<'a> Strategy for Leaky<'a> {
+   |      -- lifetime `'a` defined here
+15 |     fn on_bar(&mut self, _bar: Bar, ctx: &mut Ctx<'_>) {
+   |                                     --- has type `&mut Ctx<'1>`
+16 |         if let Some(s) = ctx.closes(InstrumentId::new(0)) {
+17 |             let _ = self.saved.set(s);
+   |                     ^^^^^^^^^^^^^^^^^ argument requires that `'1` must outlive `'a`
+   |
+   = note: requirement occurs because of the type `OnceCell<Series<'_, Price>>`, which makes the generic argument `Series<'_, Price>` invariant
+   = note: the struct `OnceCell<T>` is invariant over the parameter `T`
+   = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance

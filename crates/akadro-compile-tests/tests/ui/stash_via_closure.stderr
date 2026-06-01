@@ -1,0 +1,10 @@
+error: lifetime may not live long enough
+  --> tests/ui/stash_via_closure.rs:15:9
+   |
+12 | impl<'a> Strategy for Leaky<'a> {
+   |      -- lifetime `'a` defined here
+13 |     fn on_bar(&mut self, _bar: Bar, ctx: &mut Ctx<'_>) {
+   |                                     --- has type `&mut Ctx<'1>`
+14 |         let series = ctx.closes(InstrumentId::new(0));
+15 |         self.hook = Some(Box::new(move || series.as_ref().and_then(|s| s.latest())));
+   |         ^^^^^^^^^ assignment requires that `'1` must outlive `'a`

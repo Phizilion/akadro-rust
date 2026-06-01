@@ -1,0 +1,32 @@
+error[E0624]: associated function `new` is private
+  --> tests/ui/forge_context.rs:11:24
+   |
+11 |       let _forged = Ctx::new();
+   |                          ^^^ private associated function
+   |
+  ::: $WORKSPACE/crates/akadro-engine/src/context.rs
+   |
+   | /     pub(crate) fn new(
+   | |         market: MarketView<'bar>,
+   | |         gate: &'bar mut OrderGate,
+   | |         portfolio: &'bar Portfolio,
+   | |         specs: &'bar [InstrumentSpec],
+   | |         now: Timestamp,
+   | |     ) -> Self {
+   | |_____________- private associated function defined here
+
+error[E0061]: this function takes 5 arguments but 0 arguments were supplied
+  --> tests/ui/forge_context.rs:11:19
+   |
+11 |     let _forged = Ctx::new();
+   |                   ^^^^^^^^-- multiple arguments are missing
+   |
+note: associated function defined here
+  --> $WORKSPACE/crates/akadro-engine/src/context.rs
+   |
+   |     pub(crate) fn new(
+   |                   ^^^
+help: provide the arguments
+   |
+11 |     let _forged = Ctx::new(/* akadro_engine::market::MarketView<'_> */, /* &mut akadro_engine::context::OrderGate */, /* &akadro_engine::portfolio::Portfolio */, /* &[InstrumentSpec] */, /* Timestamp */);
+   |                            +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++

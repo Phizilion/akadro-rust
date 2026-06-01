@@ -1,0 +1,20 @@
+[package]
+name = "akadro-compile-tests"
+description = "Compile-fail/compile-pass proofs of the akadro look-ahead kill feature (not published)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# This crate is a genuinely DOWNSTREAM consumer of the engine: it depends on
+# akadro-engine but lives in a separate crate, so the `forge_context` case
+# proves the co-located, pub(crate) `Ctx` constructor is unreachable from
+# outside the engine crate (decision D1).
+[dev-dependencies]
+akadro-core.workspace = true
+akadro-engine.workspace = true
+trybuild.workspace = true
+
+[lints]
+workspace = true

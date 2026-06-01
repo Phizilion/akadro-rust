@@ -1,0 +1,45 @@
+[package]
+name = "akadro-live"
+description = "Live trading shell for akadro: auto-reconnect/resync feeds and paper trading"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+akadro-core.workspace = true
+akadro-engine.workspace = true
+akadro-backtest.workspace = true
+
+# The `binance` / `mexc` features add real WebSocket transports for those venue
+# connectors. tokio + tungstenite are confined to this crate (and behind the
+# features), so the default build stays async-free and the venue crates stay
+# tokio-free.
+akadro-venue-binance = { workspace = true, optional = true }
+akadro-venue-mexc = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+
+[features]
+default = []
+binance = [
+    "dep:akadro-venue-binance",
+    "dep:tokio",
+    "dep:tokio-tungstenite",
+    "dep:futures-util",
+    "akadro-venue-binance/net",
+]
+mexc = [
+    "dep:akadro-venue-mexc",
+    "dep:tokio",
+    "dep:tokio-tungstenite",
+    "dep:futures-util",
+    "akadro-venue-mexc/net",
+]
+
+[lints]
+workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "akadro-testkit"
+description = "Test utilities for akadro strategies: TestHarness and a mock-live feed for parity testing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+akadro-core.workspace = true
+
+[dev-dependencies]
+akadro-engine.workspace = true
+akadro-backtest.workspace = true
+
+[lints]
+workspace = true

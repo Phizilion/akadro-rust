@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy (pedantic)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --all-features
+
+  test:
+    name: test (${{ matrix.rust }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Pin the MSRV (error-text-sensitive trybuild snapshots are generated on
+        # this toolchain) and also exercise stable.
+        rust: ["1.95.0", "stable"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+      # trybuild .stderr snapshots are pinned to 1.95; only assert them there.
+      - name: test (with compile-fail snapshots)
+        if: matrix.rust == '1.95.0'
+        run: cargo test --workspace
+      - name: test (skip pinned compile-fail snapshots)
+        if: matrix.rust != '1.95.0'
+        run: cargo test --workspace --exclude akadro-compile-tests
+
+  docs:
+    name: doc
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --workspace --no-deps --all-features
+
+  coverage:
+    name: coverage (llvm-cov)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      # Region-based coverage attributes const-fn getters correctly. net.rs is
+      # live-network IO (exercised only by #[ignore] live tests), excluded from
+      # the gate. The threshold is the honest ceiling; see AGENTS.md §10 for why
+      # the residual lines (defensive-unreachable guards, #[non_exhaustive]
+      # catch-alls, test-only helper arms, attribution artifacts) cannot reach
+      # literal 100% without weakening the code or writing non-deterministic tests.
+      # `playground` is an untested scratch binary (live network, run by hand), so
+      # it is excluded from instrumentation just like the trybuild crate.
+      - run: >-
+          cargo llvm-cov --workspace --all-features
+          --exclude akadro-compile-tests --exclude playground
+          --ignore-filename-regex '(venue-(mexc|binance|okx|bybit|kucoin)/src/net|akadro-live/src/(binance|mexc))\.rs'
+          --lcov --output-path lcov.info
+      # `report` re-reads the data the previous step produced (compile-tests +
+      # playground already excluded at build time); it only re-applies the gate.
+      - run: >-
+          cargo llvm-cov report
+          --ignore-filename-regex '(venue-(mexc|binance|okx|bybit|kucoin)/src/net|akadro-live/src/(binance|mexc))\.rs'
+          --fail-under-lines 99 --fail-under-regions 98
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  semver:
+    name: semver-checks
+    runs-on: ubuntu-latest
+    # No published baseline before the first release; enable from 0.1.0 onward.
+    if: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
+
+  feature-powerset:
+    name: cargo-hack feature powerset
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-hack
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo hack --workspace --feature-powerset --no-dev-deps check

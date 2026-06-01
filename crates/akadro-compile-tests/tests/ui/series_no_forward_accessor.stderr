@@ -1,0 +1,5 @@
+error[E0599]: no method named `ahead` found for struct `Series<'bar, T>` in the current scope
+  --> tests/ui/series_no_forward_accessor.rs:15:24
+   |
+15 |         let _ = series.ahead(1);
+   |                        ^^^^^ method not found in `Series<'_, Price>`

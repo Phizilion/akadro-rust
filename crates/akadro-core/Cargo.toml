@@ -1,0 +1,25 @@
+[package]
+name = "akadro-core"
+description = "Core domain vocabulary and exchange-extension traits for the akadro backtesting/live trading framework"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+smallvec.workspace = true
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest.workspace = true
+
+[features]
+# Derive serde on the value vocabulary, so reports/manifests can be persisted.
+serde = ["dep:serde"]
+
+[lints]
+workspace = true

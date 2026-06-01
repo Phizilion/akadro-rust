@@ -1,0 +1,17 @@
+[package]
+name = "akadro-indicators"
+description = "Incremental, look-ahead-safe technical indicators for akadro strategies"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# Deliberately dependency-free: indicators are pure integer math over scaled
+# values, reusable anywhere. Feed `price.raw()`; outputs are in the same scale.
+[dependencies]
+
+[lints]
+workspace = true

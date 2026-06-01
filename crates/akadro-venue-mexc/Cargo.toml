@@ -1,0 +1,33 @@
+[package]
+name = "akadro-venue-mexc"
+description = "MEXC exchange connector for the akadro trading framework (spot, REST)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+akadro-core.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+smallvec.workspace = true
+# Real network transport (reqwest::blocking) is opt-in; the pure connector logic
+# (signing, parsing, normalization) is always built and fixture-tested.
+reqwest = { workspace = true, optional = true }
+
+[dev-dependencies]
+akadro-engine.workspace = true
+
+[features]
+default = []
+net = ["dep:reqwest"]
+
+[lints]
+workspace = true

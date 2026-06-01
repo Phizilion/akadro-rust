@@ -1,0 +1,19 @@
+# Example playground config. Copy to `playground.toml` in the directory you run
+# from (the workspace root for `cargo run -p playground`), or pass an explicit
+# path with `--config <file>`. Any field can also be overridden on the CLI with
+# `--field value` (CLI wins over the file, which wins over the built-in defaults).
+#
+# Changing values here (or via CLI flags) needs NO recompile — the binary reads
+# them at startup.
+
+base_url     = "https://api.mexc.com"
+symbol       = "BTCUSDT"
+interval     = "5m"          # 1m | 5m | 15m | 30m | 1h | 4h | 1d
+start        = "2025-05-01"  # YYYY-MM-DD (UTC) or raw epoch-ms
+end          = "2026-05-01"
+fast         = 48            # fast SMA window, in bars
+slow         = 192           # slow SMA window, in bars
+fee_bps      = 5             # taker fee, basis points
+cash         = 1000000       # starting cash, in quote units (e.g. USDT)
+deploy_pct   = 90            # percent of capital deployed per position
+enforce_cash = true          # reject buys the account cannot afford

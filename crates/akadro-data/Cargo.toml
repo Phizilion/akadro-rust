@@ -1,0 +1,22 @@
+[package]
+name = "akadro-data"
+description = "Columnar on-disk cache (Arrow IPC/Feather) and incremental download planning for akadro market data"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+akadro-core.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+arrow-ipc = { workspace = true, features = ["lz4"] }
+serde = { workspace = true }
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,27 @@
+error: lifetime may not live long enough
+  --> tests/ui/stash_via_rc_refcell.rs:17:10
+   |
+15 | impl<'a> Strategy for Leaky<'a> {
+   |      -- lifetime `'a` defined here
+16 |     fn on_bar(&mut self, _bar: Bar, ctx: &mut Ctx<'_>) {
+   |                                     --- has type `&mut Ctx<'1>`
+17 |         *self.saved.borrow_mut() = ctx.closes(InstrumentId::new(0));
+   |          ^^^^^^^^^^^^^^^^^^^^^^^ argument requires that `'1` must outlive `'a`
+   |
+   = note: requirement occurs because of the type `RefCell<Option<Series<'_, Price>>>`, which makes the generic argument `Option<Series<'_, Price>>` invariant
+   = note: the struct `RefCell<T>` is invariant over the parameter `T`
+   = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance
+
+error: lifetime may not live long enough
+  --> tests/ui/stash_via_rc_refcell.rs:17:36
+   |
+15 | impl<'a> Strategy for Leaky<'a> {
+   |      -- lifetime `'a` defined here
+16 |     fn on_bar(&mut self, _bar: Bar, ctx: &mut Ctx<'_>) {
+   |                                     --- has type `&mut Ctx<'1>`
+17 |         *self.saved.borrow_mut() = ctx.closes(InstrumentId::new(0));
+   |                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ argument requires that `'a` must outlive `'1`
+   |
+   = note: requirement occurs because of the type `Ctx<'_>`, which makes the generic argument `'_` invariant
+   = note: the struct `Ctx<'bar>` is invariant over the parameter `'bar`
+   = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance

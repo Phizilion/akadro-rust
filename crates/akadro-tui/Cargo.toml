@@ -1,0 +1,18 @@
+[package]
+name = "akadro-tui"
+description = "Live terminal dashboard (price/equity charts, fills, metadata) for an akadro run, via the Observer interface"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+akadro-core.workspace = true
+akadro-engine.workspace = true
+ratatui.workspace = true
+
+[lints]
+workspace = true

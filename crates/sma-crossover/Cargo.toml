@@ -1,0 +1,20 @@
+[package]
+name = "sma-crossover"
+description = "Example SMA-crossover strategy demonstrating the akadro Strategy API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+akadro-core.workspace = true
+akadro-engine.workspace = true
+
+[dev-dependencies]
+akadro-backtest.workspace = true
+
+[lints]
+workspace = true

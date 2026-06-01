@@ -1,0 +1,47 @@
+[package]
+name = "akadro"
+description = "Umbrella crate re-exporting the akadro backtesting and live trading framework"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+akadro-core.workspace = true
+akadro-engine.workspace = true
+akadro-backtest = { workspace = true, optional = true }
+akadro-testkit = { workspace = true, optional = true }
+akadro-indicators = { workspace = true, optional = true }
+akadro-analytics = { workspace = true, optional = true }
+akadro-data = { workspace = true, optional = true }
+akadro-live = { workspace = true, optional = true }
+
+[dev-dependencies]
+akadro-backtest.workspace = true
+akadro-testkit.workspace = true
+akadro-analytics.workspace = true
+sma-crossover.workspace = true
+proptest.workspace = true
+
+[features]
+default = ["backtest"]
+# Conservative simulated exchange + historical feed.
+backtest = ["dep:akadro-backtest"]
+# Strategy test harness + mock-live feed (for parity testing).
+testkit = ["dep:akadro-testkit"]
+# Incremental technical indicators.
+indicators = ["dep:akadro-indicators"]
+# Performance/risk analytics over backtest results.
+analytics = ["dep:akadro-analytics"]
+# Columnar on-disk market-data cache.
+data = ["dep:akadro-data"]
+# Live trading shell: auto-reconnect feeds + paper trading.
+live = ["dep:akadro-live"]
+# Persist `RunReport` to/from a backward-compatible JSON file.
+serde = ["akadro-engine/serde"]
+
+[lints]
+workspace = true

@@ -1,0 +1,689 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! Reading and writing OHLCV bar partitions as Arrow IPC / Feather files.
+//!
+//! Writes are **atomic** (temp-file + rename), **LZ4-compressed**, and reads
+//! validate the cache format version, the 6-column shape, and strictly-ascending
+//! timestamps. The `ts` column is an Arrow `Timestamp(Nanosecond, "UTC")` so
+//! external dataframe tools (pandas / `Polars` / `DuckDB`) render it as a real
+//! datetime. LZ4 decompression is ~free relative to the disk I/O it saves.
+
+use std::collections::HashMap;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use akadro_core::{Bar, DataSource, Event, InstrumentId, Price, Qty, Timestamp};
+use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, TimestampNanosecondArray};
+use arrow_ipc::CompressionType;
+use arrow_ipc::reader::FileReader;
+use arrow_ipc::writer::{FileWriter, IpcWriteOptions};
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
+
+const FORMAT_VERSION: &str = "1";
+
+/// Errors from the on-disk cache.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum DataError {
+    /// Filesystem I/O error. The foreign `std::io::Error` is wrapped rather than
+    /// `#[from]`-leaked (workspace error policy, i11); its [`std::io::ErrorKind`] is
+    /// preserved so callers can still branch on `NotFound` / `PermissionDenied` etc.
+    #[error("io error ({kind:?}): {message}")]
+    Io {
+        /// The OS error category.
+        kind: std::io::ErrorKind,
+        /// Human-readable detail.
+        message: String,
+    },
+    /// Arrow read/write error.
+    #[error("arrow error: {0}")]
+    Arrow(String),
+    /// The file's schema or metadata did not match expectations.
+    #[error("schema/metadata error: {0}")]
+    Schema(String),
+}
+
+impl From<std::io::Error> for DataError {
+    fn from(e: std::io::Error) -> Self {
+        // Deliberate wrapping conversion: capture the category + message, but do not
+        // store the foreign error type in the public enum (i11).
+        DataError::Io {
+            kind: e.kind(),
+            message: e.to_string(),
+        }
+    }
+}
+
+fn schema_with_meta(instrument: InstrumentId, price_scale: u32, qty_scale: u32) -> Arc<Schema> {
+    let mut meta = HashMap::new();
+    meta.insert("instrument".to_owned(), instrument.index().to_string());
+    meta.insert("price_scale".to_owned(), price_scale.to_string());
+    meta.insert("qty_scale".to_owned(), qty_scale.to_string());
+    meta.insert(
+        "akadro_cache_format_version".to_owned(),
+        FORMAT_VERSION.to_owned(),
+    );
+    Arc::new(
+        Schema::new(vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("open", DataType::Int64, false),
+            Field::new("high", DataType::Int64, false),
+            Field::new("low", DataType::Int64, false),
+            Field::new("close", DataType::Int64, false),
+            Field::new("volume", DataType::Int64, false),
+        ])
+        .with_metadata(meta),
+    )
+}
+
+/// Write `bars` (all for one `instrument`) to `path` as a Feather partition.
+/// The instrument and fixed-point scales are stored in the file metadata.
+pub fn write_partition(
+    path: &Path,
+    instrument: InstrumentId,
+    price_scale: u32,
+    qty_scale: u32,
+    bars: &[Bar],
+) -> Result<(), DataError> {
+    let schema = schema_with_meta(instrument, price_scale, qty_scale);
+    let col = |f: &dyn Fn(&Bar) -> i64| -> ArrayRef {
+        Arc::new(Int64Array::from(bars.iter().map(f).collect::<Vec<_>>()))
+    };
+    let ts_col: ArrayRef = Arc::new(
+        TimestampNanosecondArray::from(bars.iter().map(|b| b.ts.as_nanos()).collect::<Vec<_>>())
+            .with_timezone("UTC"),
+    );
+    let columns: Vec<ArrayRef> = vec![
+        ts_col,
+        col(&|b| b.open.raw()),
+        col(&|b| b.high.raw()),
+        col(&|b| b.low.raw()),
+        col(&|b| b.close.raw()),
+        col(&|b| b.volume.raw()),
+    ];
+    let batch = RecordBatch::try_new(schema.clone(), columns)
+        .map_err(|e| DataError::Arrow(e.to_string()))?;
+
+    // LZ4-frame compression: the columnar i64 data compresses ~2-4x and decodes at
+    // GB/s, so the smaller file is a net I/O win. Readers detect it from the header.
+    let options = IpcWriteOptions::default()
+        .try_with_compression(Some(CompressionType::LZ4_FRAME))
+        .map_err(|e| DataError::Arrow(e.to_string()))?;
+
+    // Atomic publish: write a temp file, fsync via `finish`, then rename into
+    // place (atomic on POSIX). A crash mid-write leaves only the `.tmp`, never a
+    // truncated cache file that `load_or_cache` would accept as a hit.
+    let tmp = path.with_extension("feather.tmp");
+    let write = || -> Result<(), DataError> {
+        let file = File::create(&tmp)?;
+        let mut writer = FileWriter::try_new_with_options(file, &schema, options.clone())
+            .map_err(|e| DataError::Arrow(e.to_string()))?;
+        writer
+            .write(&batch)
+            .map_err(|e| DataError::Arrow(e.to_string()))?;
+        writer
+            .finish()
+            .map_err(|e| DataError::Arrow(e.to_string()))?;
+        Ok(())
+    };
+    match write() {
+        Ok(()) => {
+            std::fs::rename(&tmp, path)?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp); // best-effort cleanup
+            Err(e)
+        }
+    }
+}
+
+/// Drain a [`DataSource`] and cache its bars for `instrument` to `path`.
+///
+/// This is the venue-agnostic downloader glue: pass any `DataSource` (e.g.
+/// `akadro-venue-mexc`'s `MexcKlineFeed`, which fetches MEXC klines) to
+/// fetch-then-cache. Returns the number of bars written and their
+/// `(first_ts, last_ts)` nanosecond range (for recording in a [`Manifest`](crate::Manifest)).
+///
+/// # Errors
+/// Returns a [`DataError`] if writing the partition fails.
+pub fn cache_from_source<D: DataSource>(
+    mut source: D,
+    path: &Path,
+    instrument: InstrumentId,
+    price_scale: u32,
+    qty_scale: u32,
+) -> Result<(usize, Option<(i64, i64)>), DataError> {
+    let mut bars = Vec::new();
+    while let Some(event) = source.next_event() {
+        if let Event::Bar(bar) = event
+            && bar.instrument == instrument
+        {
+            bars.push(bar);
+        }
+    }
+    let range = match (bars.first(), bars.last()) {
+        (Some(f), Some(l)) => Some((f.ts.as_nanos(), l.ts.as_nanos())),
+        _ => None,
+    };
+    write_partition(path, instrument, price_scale, qty_scale, &bars)?;
+    Ok((bars.len(), range))
+}
+
+/// Load bars from the cached Feather partition at `path` if it exists; otherwise
+/// build the source with `make_source`, drain it into the cache, and return the
+/// bars. This is the "download once, then replay offline" convenience — e.g.
+/// `load_or_cache(path, id, ps, qs, || MexcKlineFeed::new(..).with_range(..))` —
+/// so callers never hand-roll the download-and-cache dance. The source is only
+/// built (and the network only touched) on a cache miss.
+///
+/// # Errors
+/// Returns a [`DataError`] if reading or writing the partition fails.
+pub fn load_or_cache<D, F>(
+    path: &Path,
+    instrument: InstrumentId,
+    price_scale: u32,
+    qty_scale: u32,
+    make_source: F,
+) -> Result<Vec<Bar>, DataError>
+where
+    D: DataSource,
+    F: FnOnce() -> D,
+{
+    if path.exists() {
+        let loaded = read_partition(path)?;
+        validate_cache_meta(&loaded, instrument, price_scale, qty_scale, path)?;
+        return Ok(loaded.bars);
+    }
+    cache_from_source(make_source(), path, instrument, price_scale, qty_scale)?;
+    Ok(read_partition(path)?.bars)
+}
+
+/// Reject a cache hit whose recorded instrument / scales differ from what the
+/// caller requested. `Bar` carries no embedded scale, so silently returning
+/// wrong-scaled raw integers (e.g. after a venue precision change) would be a
+/// 10^Δ price error with no symptom — surface it as a `Schema` error instead so the
+/// caller deletes the stale partition (M17).
+fn validate_cache_meta(
+    loaded: &LoadedBars,
+    instrument: InstrumentId,
+    price_scale: u32,
+    qty_scale: u32,
+    path: &Path,
+) -> Result<(), DataError> {
+    if loaded.instrument != instrument
+        || loaded.price_scale != price_scale
+        || loaded.qty_scale != qty_scale
+    {
+        return Err(DataError::Schema(format!(
+            "cache at {} holds instrument {:?} scale ({}, {}) but the request is for \
+             instrument {:?} scale ({}, {}) — delete the stale partition and re-fetch",
+            path.display(),
+            loaded.instrument,
+            loaded.price_scale,
+            loaded.qty_scale,
+            instrument,
+            price_scale,
+            qty_scale,
+        )));
+    }
+    Ok(())
+}
+
+/// A partition loaded from disk: the instrument, its scales, and its bars.
+#[derive(Debug, Clone)]
+pub struct LoadedBars {
+    /// Instrument the partition is for.
+    pub instrument: InstrumentId,
+    /// Price fixed-point scale recorded in the file.
+    pub price_scale: u32,
+    /// Quantity fixed-point scale recorded in the file.
+    pub qty_scale: u32,
+    /// The bars, in file (time) order.
+    pub bars: Vec<Bar>,
+}
+
+/// Identifies one instrument's cached bar partition for [`load_or_cache_many`].
+#[derive(Clone, Debug)]
+pub struct BarSpec {
+    /// Cache file path for this instrument's bars.
+    pub path: PathBuf,
+    /// Dense instrument id.
+    pub instrument: InstrumentId,
+    /// Price fixed-point scale.
+    pub price_scale: u32,
+    /// Quantity fixed-point scale.
+    pub qty_scale: u32,
+}
+
+/// Load (or download-and-cache) bars for **many** instruments and merge them into
+/// one timestamp-ordered `Vec<Bar>` ready for `HistoricalFeed::from_bars` — the
+/// cross-sectional / multi-instrument loader. `make_source` builds the
+/// [`DataSource`] for each [`BarSpec`] (typically a venue kline feed bound to that
+/// instrument's symbol). Each instrument is cached independently via
+/// [`load_or_cache`], then all bars are merged by event time with a **stable**
+/// sort — equal-timestamp bars keep their per-instrument order, so the merged feed
+/// is deterministic. Empty `specs` yields an empty vector.
+///
+/// # Errors
+/// The first [`DataError`] from any instrument's load / cache / fetch.
+pub fn load_or_cache_many<D, F>(specs: &[BarSpec], make_source: F) -> Result<Vec<Bar>, DataError>
+where
+    D: DataSource,
+    F: Fn(&BarSpec) -> D,
+{
+    let mut all: Vec<Bar> = Vec::new();
+    for spec in specs {
+        let bars = load_or_cache(
+            &spec.path,
+            spec.instrument,
+            spec.price_scale,
+            spec.qty_scale,
+            || make_source(spec),
+        )?;
+        all.extend(bars);
+    }
+    all.sort_by_key(|b| b.ts.as_nanos()); // stable merge by event time
+    Ok(all)
+}
+
+/// Read a Feather partition written by [`write_partition`].
+pub fn read_partition(path: &Path) -> Result<LoadedBars, DataError> {
+    let file = File::open(path)?;
+    let reader = FileReader::try_new(file, None).map_err(|e| DataError::Arrow(e.to_string()))?;
+
+    let meta = reader.schema().metadata().clone();
+    let get_u32 = |k: &str| -> Result<u32, DataError> {
+        meta.get(k)
+            .and_then(|v| v.parse::<u32>().ok())
+            .ok_or_else(|| DataError::Schema(format!("missing/invalid metadata key {k:?}")))
+    };
+    // Reject a partition written by an incompatible (newer/unknown) cache format.
+    let version = meta.get("akadro_cache_format_version").map(String::as_str);
+    if version != Some(FORMAT_VERSION) {
+        return Err(DataError::Schema(format!(
+            "unsupported cache format version {version:?} (this build reads {FORMAT_VERSION})"
+        )));
+    }
+    let instrument = InstrumentId::new(get_u32("instrument")?);
+    let price_scale = get_u32("price_scale")?;
+    let qty_scale = get_u32("qty_scale")?;
+
+    let mut bars = Vec::new();
+    for batch in reader {
+        let batch = batch.map_err(|e| DataError::Arrow(e.to_string()))?;
+        // Guard the column shape before indexing: a structurally-valid Arrow file
+        // with the wrong column count must surface a `DataError`, not panic on an
+        // out-of-range `batch.column(i)`.
+        if batch.num_columns() != 6 {
+            return Err(DataError::Schema(format!(
+                "expected 6 columns, found {}",
+                batch.num_columns()
+            )));
+        }
+        // The `ts` column must carry the UTC tz annotation we write. A tz-naive or
+        // differently-zoned external Arrow file downcasts to the same
+        // `TimestampNanosecondArray` and would be silently misread (i12).
+        if !matches!(
+            batch.schema().field(0).data_type(),
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(tz)) if tz.as_ref() == "UTC"
+        ) {
+            return Err(DataError::Schema(
+                "ts column must be Timestamp(Nanosecond, \"UTC\")".to_owned(),
+            ));
+        }
+        let col = |i: usize| -> Result<&Int64Array, DataError> {
+            batch
+                .column(i)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| DataError::Schema(format!("column {i} is not Int64")))
+        };
+        let ts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .ok_or_else(|| {
+                DataError::Schema("ts column is not Timestamp(Nanosecond)".to_owned())
+            })?;
+        let (open, high, low, close, volume) = (col(1)?, col(2)?, col(3)?, col(4)?, col(5)?);
+        for r in 0..batch.num_rows() {
+            bars.push(Bar::new(
+                instrument,
+                Timestamp::from_nanos(ts.value(r)),
+                Price::from_raw(open.value(r)),
+                Price::from_raw(high.value(r)),
+                Price::from_raw(low.value(r)),
+                Price::from_raw(close.value(r)),
+                Qty::from_raw(volume.value(r)),
+            ));
+        }
+    }
+    // The engine trusts a DataSource's time ordering; a corrupt/out-of-order
+    // partition would silently produce wrong look-backs and fills, so reject it.
+    for w in bars.windows(2) {
+        if w[0].ts.as_nanos() >= w[1].ts.as_nanos() {
+            return Err(DataError::Schema(
+                "bars are not in strictly ascending timestamp order".to_owned(),
+            ));
+        }
+    }
+    Ok(LoadedBars {
+        instrument,
+        price_scale,
+        qty_scale,
+        bars,
+    })
+}
+
+/// A [`DataSource`] that replays a cached Feather partition into the engine.
+#[derive(Debug)]
+pub struct FeatherBarSource {
+    bars: std::vec::IntoIter<Bar>,
+}
+
+impl FeatherBarSource {
+    /// Load a partition and prepare to replay it.
+    ///
+    /// # Errors
+    /// Returns a [`DataError`] if the file cannot be read or parsed.
+    pub fn open(path: &Path) -> Result<Self, DataError> {
+        Ok(FeatherBarSource {
+            bars: read_partition(path)?.bars.into_iter(),
+        })
+    }
+}
+
+impl DataSource for FeatherBarSource {
+    fn next_event(&mut self) -> Option<Event> {
+        self.bars.next().map(Event::Bar)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_bars() -> Vec<Bar> {
+        (1..=5)
+            .map(|i| {
+                let p = Price::from_raw(100 + i);
+                Bar::new(
+                    InstrumentId::new(3),
+                    Timestamp::from_nanos(i * 60_000_000_000),
+                    p,
+                    Price::from_raw(110 + i),
+                    Price::from_raw(90 + i),
+                    p,
+                    Qty::from_raw(1000 + i),
+                )
+            })
+            .collect()
+    }
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("akadro_data_test_{name}.feather"))
+    }
+
+    #[test]
+    fn round_trip_preserves_bars_and_metadata() {
+        let path = tmp("roundtrip");
+        let bars = sample_bars();
+        write_partition(&path, InstrumentId::new(3), 2, 6, &bars).unwrap();
+
+        let loaded = read_partition(&path).unwrap();
+        assert_eq!(loaded.instrument, InstrumentId::new(3));
+        assert_eq!(loaded.price_scale, 2);
+        assert_eq!(loaded.qty_scale, 6);
+        assert_eq!(loaded.bars, bars); // exact integer round-trip
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_to_unwritable_path_errors_via_cleanup_branch() {
+        // A path under a nonexistent directory makes the temp-file create fail, so
+        // write_partition takes the error-cleanup branch and returns Err.
+        let path = std::path::Path::new("/nonexistent_akadro_dir_zzz/x.feather");
+        let err = write_partition(path, InstrumentId::new(3), 2, 6, &sample_bars()).unwrap_err();
+        assert!(matches!(err, DataError::Io { .. }));
+    }
+
+    #[test]
+    fn read_rejects_out_of_order_timestamps() {
+        let path = tmp("oooo");
+        // write_partition does not validate order, so we can craft a bad partition.
+        let p = Price::from_raw(100);
+        let bad = vec![
+            Bar::new(
+                InstrumentId::new(3),
+                Timestamp::from_nanos(20),
+                p,
+                p,
+                p,
+                p,
+                Qty::from_raw(1),
+            ),
+            Bar::new(
+                InstrumentId::new(3),
+                Timestamp::from_nanos(10),
+                p,
+                p,
+                p,
+                p,
+                Qty::from_raw(1),
+            ),
+        ];
+        write_partition(&path, InstrumentId::new(3), 2, 6, &bad).unwrap();
+        let err = read_partition(&path).unwrap_err();
+        assert!(
+            matches!(err, DataError::Schema(_)),
+            "out-of-order -> schema error"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn feather_source_replays_in_order() {
+        let path = tmp("source");
+        let bars = sample_bars();
+        write_partition(&path, InstrumentId::new(3), 2, 6, &bars).unwrap();
+
+        let mut src = FeatherBarSource::open(&path).unwrap();
+        let mut seen = Vec::new();
+        while let Some(Event::Bar(b)) = src.next_event() {
+            seen.push(b);
+        }
+        assert_eq!(seen, bars);
+        assert!(src.next_event().is_none());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn empty_partition_round_trips() {
+        let path = tmp("empty");
+        write_partition(&path, InstrumentId::new(0), 2, 2, &[]).unwrap();
+        let loaded = read_partition(&path).unwrap();
+        assert!(loaded.bars.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_or_cache_rejects_scale_mismatch() {
+        // M17: a cache hit whose recorded scale differs from the request must error,
+        // not silently return wrong-scaled bars.
+        struct NeverSource;
+        impl DataSource for NeverSource {
+            fn next_event(&mut self) -> Option<Event> {
+                panic!("source must not be built on a cache hit")
+            }
+        }
+        let path = tmp("scale_mismatch");
+        write_partition(&path, InstrumentId::new(3), 2, 6, &sample_bars()).unwrap();
+        // Same instrument, but price_scale 4 != the cached 2.
+        let err = load_or_cache(&path, InstrumentId::new(3), 4, 6, || NeverSource).unwrap_err();
+        assert!(matches!(err, DataError::Schema(_)), "{err:?}");
+        // The matching scale still loads fine (and never builds the source).
+        let ok = load_or_cache(&path, InstrumentId::new(3), 2, 6, || NeverSource).unwrap();
+        assert_eq!(ok, sample_bars());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cache_from_source_drains_and_writes() {
+        struct VecSource(std::vec::IntoIter<Event>);
+        impl DataSource for VecSource {
+            fn next_event(&mut self) -> Option<Event> {
+                self.0.next()
+            }
+        }
+        let path = tmp("download");
+        let bars = sample_bars();
+        // Interleave a non-bar event to confirm it's skipped, not a stop point.
+        let mut events: Vec<Event> = bars.iter().copied().map(Event::Bar).collect();
+        events.insert(
+            2,
+            Event::Resync {
+                instrument: None,
+                ts: Timestamp::from_nanos(1),
+            },
+        );
+        let src = VecSource(events.into_iter());
+
+        let (count, range) = cache_from_source(src, &path, InstrumentId::new(3), 2, 6).unwrap();
+        assert_eq!(count, bars.len());
+        assert_eq!(
+            range,
+            Some((bars[0].ts.as_nanos(), bars[bars.len() - 1].ts.as_nanos()))
+        );
+        assert_eq!(read_partition(&path).unwrap().bars, bars);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn missing_file_errors() {
+        let err = read_partition(Path::new("/nonexistent/akadro/none.feather")).unwrap_err();
+        assert!(matches!(err, DataError::Io { .. }));
+        assert!(format!("{err}").contains("io"));
+    }
+
+    #[test]
+    fn cache_from_empty_source_yields_no_range() {
+        struct Empty;
+        impl DataSource for Empty {
+            fn next_event(&mut self) -> Option<Event> {
+                None
+            }
+        }
+        let path = tmp("empty_source");
+        // A source yielding nothing (or only the wrong instrument) leaves `bars`
+        // empty -> the range falls through to `None`.
+        let (count, range) = cache_from_source(Empty, &path, InstrumentId::new(0), 2, 6).unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(range, None);
+        // An empty partition still round-trips losslessly.
+        assert!(read_partition(&path).unwrap().bars.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_or_cache_downloads_once_then_serves_from_cache() {
+        struct VecSrc(std::vec::IntoIter<Event>);
+        impl DataSource for VecSrc {
+            fn next_event(&mut self) -> Option<Event> {
+                self.0.next()
+            }
+        }
+        let path = tmp("load_or_cache");
+        let _ = std::fs::remove_file(&path);
+        let bars = sample_bars();
+        let builds = std::cell::Cell::new(0);
+        let make = || {
+            builds.set(builds.get() + 1);
+            let evs: Vec<Event> = bars.iter().copied().map(Event::Bar).collect();
+            VecSrc(evs.into_iter())
+        };
+        // Cache miss: builds the source, drains it, writes the partition.
+        let got = load_or_cache(&path, InstrumentId::new(3), 2, 6, make).unwrap();
+        assert_eq!(got, bars);
+        assert_eq!(builds.get(), 1);
+        // Cache hit: serves from the file; the source factory is NOT called.
+        let got2 = load_or_cache(&path, InstrumentId::new(3), 2, 6, || {
+            builds.set(builds.get() + 1);
+            VecSrc(Vec::new().into_iter())
+        })
+        .unwrap();
+        assert_eq!(got2, bars);
+        assert_eq!(builds.get(), 1); // unchanged — no second download
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_or_cache_many_merges_instruments_by_timestamp() {
+        struct VecSrc(std::vec::IntoIter<Event>);
+        impl DataSource for VecSrc {
+            fn next_event(&mut self) -> Option<Event> {
+                self.0.next()
+            }
+        }
+        let mk = |inst: u32, ts: i64| {
+            Bar::new(
+                InstrumentId::new(inst),
+                Timestamp::from_nanos(ts),
+                Price::from_raw(1),
+                Price::from_raw(1),
+                Price::from_raw(1),
+                Price::from_raw(1),
+                Qty::from_raw(1),
+            )
+        };
+        let (p0, p1) = (tmp("many_0"), tmp("many_1"));
+        let _ = std::fs::remove_file(&p0);
+        let _ = std::fs::remove_file(&p1);
+        let specs = vec![
+            BarSpec {
+                path: p0.clone(),
+                instrument: InstrumentId::new(0),
+                price_scale: 0,
+                qty_scale: 0,
+            },
+            BarSpec {
+                path: p1.clone(),
+                instrument: InstrumentId::new(1),
+                price_scale: 0,
+                qty_scale: 0,
+            },
+        ];
+        // i0: bars at ts 10, 30; i1: bars at ts 20, 40 — interleave on merge.
+        let merged = load_or_cache_many(&specs, |spec| {
+            let bars = if spec.instrument.index() == 0 {
+                vec![mk(0, 10), mk(0, 30)]
+            } else {
+                vec![mk(1, 20), mk(1, 40)]
+            };
+            VecSrc(
+                bars.into_iter()
+                    .map(Event::Bar)
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            )
+        })
+        .unwrap();
+        let ts: Vec<i64> = merged.iter().map(|b| b.ts.as_nanos()).collect();
+        assert_eq!(ts, vec![10, 20, 30, 40]); // merged in event-time order
+
+        // Empty specs → empty.
+        let empty = load_or_cache_many(&[], |_| VecSrc(Vec::new().into_iter())).unwrap();
+        assert!(empty.is_empty());
+        let _ = std::fs::remove_file(&p0);
+        let _ = std::fs::remove_file(&p1);
+    }
+}

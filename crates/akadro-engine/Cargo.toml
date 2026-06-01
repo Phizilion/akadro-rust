@@ -1,0 +1,34 @@
+[package]
+name = "akadro-engine"
+description = "The akadro event loop and the look-ahead-safe strategy context (Ctx/MarketView/Series + the compile-time future-data guarantee)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+akadro-core.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+rand_core.workspace = true
+rand_chacha.workspace = true
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+
+[features]
+# Persist a `RunReport` to/from a (backward-compatible) JSON file.
+serde = ["dep:serde", "dep:serde_json", "akadro-core/serde"]
+
+[[bench]]
+name = "merge"
+harness = false
+
+[lints]
+workspace = true

@@ -1,0 +1,31 @@
+[package]
+name = "akadro-venue-bybit"
+description = "Bybit exchange connector for the akadro trading framework (v5 unified: spot + linear perp, REST)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+akadro-core.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+smallvec.workspace = true
+reqwest = { workspace = true, optional = true }
+
+[dev-dependencies]
+akadro-engine.workspace = true
+
+[features]
+default = []
+net = ["dep:reqwest"]
+
+[lints]
+workspace = true

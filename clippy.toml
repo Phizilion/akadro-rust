@@ -1,0 +1,3 @@
+# Brand names with internal capitalization that clippy's `doc_markdown` lint would
+# otherwise mistake for code identifiers. `..` extends (not replaces) the defaults.
+doc-valid-idents = ["KuCoin", ".."]

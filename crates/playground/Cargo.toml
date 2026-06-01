@@ -1,0 +1,18 @@
+[package]
+name = "playground"
+description = "Scratch binary for experimenting with akadro against real MEXC market data (NOT part of the library)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# The umbrella (backtest is on by default) plus analytics, the data cache, and
+# serde (to save the run report to a file).
+akadro = { path = "../akadro", features = ["analytics", "data", "serde"] }
+# The MEXC connector with its real reqwest transport.
+akadro-venue-mexc = { path = "../akadro-venue-mexc", features = ["net"] }
+
+[lints]
+workspace = true

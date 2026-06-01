@@ -1,0 +1,137 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/akadro-core",
+    "crates/akadro-engine",
+    "crates/akadro-backtest",
+    "crates/akadro-testkit",
+    "crates/akadro",
+    "crates/sma-crossover",
+    "crates/akadro-venue-mexc",
+    "crates/akadro-venue-binance",
+    "crates/akadro-venue-okx",
+    "crates/akadro-venue-bybit",
+    "crates/akadro-venue-kucoin",
+    "crates/akadro-indicators",
+    "crates/akadro-analytics",
+    "crates/akadro-data",
+    "crates/akadro-venue-dex",
+    "crates/akadro-live",
+    "crates/akadro-tui",
+    "crates/akadro-compile-tests",
+    "crates/playground",
+]
+
+# ----------------------------------------------------------------------------
+# Shared package metadata. Every member inherits these via `field.workspace =
+# true`, keeping version/MSRV/license consistent across the workspace.
+# ----------------------------------------------------------------------------
+[workspace.package]
+version = "0.1.1"
+edition = "2024"
+rust-version = "1.95"
+license = "MPL-2.0"
+authors = ["Phizilion"]
+keywords = ["trading", "backtest", "quant", "finance", "exchange"]
+categories = ["finance", "simulation"]
+
+# ----------------------------------------------------------------------------
+# Shared dependency versions. Internal crates are path deps so the workspace
+# builds standalone; external versions are pinned with caret ranges.
+# ----------------------------------------------------------------------------
+[workspace.dependencies]
+akadro-core = { version = "0.1.1", path = "crates/akadro-core" }
+akadro-engine = { version = "0.1.1", path = "crates/akadro-engine" }
+akadro-backtest = { version = "0.1.1", path = "crates/akadro-backtest" }
+akadro-testkit = { version = "0.1.1", path = "crates/akadro-testkit" }
+akadro-indicators = { version = "0.1.1", path = "crates/akadro-indicators" }
+akadro-analytics = { version = "0.1.1", path = "crates/akadro-analytics" }
+akadro-data = { version = "0.1.1", path = "crates/akadro-data" }
+akadro-venue-dex = { version = "0.1.1", path = "crates/akadro-venue-dex" }
+akadro-venue-binance = { version = "0.1.1", path = "crates/akadro-venue-binance" }
+akadro-venue-mexc = { version = "0.1.1", path = "crates/akadro-venue-mexc" }
+akadro-venue-okx = { version = "0.1.1", path = "crates/akadro-venue-okx" }
+akadro-venue-bybit = { version = "0.1.1", path = "crates/akadro-venue-bybit" }
+akadro-venue-kucoin = { version = "0.1.1", path = "crates/akadro-venue-kucoin" }
+akadro-live = { version = "0.1.1", path = "crates/akadro-live" }
+sma-crossover = { version = "0.1.1", path = "crates/sma-crossover" }
+
+thiserror = "2.0"
+smallvec = "1.13"
+rand_core = "0.9"
+rand_chacha = "0.9"
+
+# venue-connector deps (MEXC). Network deps are optional / behind a feature.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+
+# async live WebSocket transport (akadro-live `binance`/`mexc` features only)
+tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "macros", "sync"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+
+# columnar on-disk cache (akadro-data)
+arrow-array = "55"
+arrow-schema = "55"
+arrow-ipc = "55"
+
+# terminal dashboard (akadro-tui)
+ratatui = "0.29"
+
+# dev / optional tooling
+trybuild = "1.0"
+proptest = "1.5"
+criterion = "0.5"
+
+# ----------------------------------------------------------------------------
+# Workspace-wide lints. Members opt in with `[lints] workspace = true`.
+# We FORBID unsafe everywhere in the MVP (akadro-data, the only crate that will
+# ever need it, does not exist yet and will override locally behind audited
+# `// SAFETY:` modules). We run clippy::pedantic as a warning gate.
+# ----------------------------------------------------------------------------
+[workspace.lints.rust]
+# Lint groups must sit at lower priority than the specific lints that override
+# them (cargo enforces this), hence priority = -1 on the group.
+rust_2024_compatibility = { level = "warn", priority = -1 }
+unsafe_code = "forbid"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# These pedantic lints fight idiomatic finance code or our newtype style; allow
+# explicitly so the rest of pedantic stays a hard gate.
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+# usize->i64 for small window sizes / indices cannot realistically wrap.
+cast_possible_wrap = "allow"
+# `i64 as i128` widening is deliberate and lives in `const fn`s where the
+# `i128::from` alternative is unavailable (`From` is not const). It is always
+# lossless here, so silence the lint rather than contort the money math.
+cast_lossless = "allow"
+
+# ----------------------------------------------------------------------------
+# Profiles. `release` is tuned for deterministic, fully-inlined backtests; the
+# `bench` profile inherits it. A faster `dev` keeps the inner edit/test loop
+# snappy while still catching arithmetic mistakes via overflow checks.
+# ----------------------------------------------------------------------------
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
+overflow-checks = true
+debug-assertions = true

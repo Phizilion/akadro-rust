@@ -1,0 +1,43 @@
+# Build artifacts
+/target
+**/target
+
+# Generated research/spec artifacts from the architecture & MEXC workflows
+# (the conclusions live in AGENTS.md; the raw JSON is large and reproducible).
+/.workflow-artifacts/
+
+# Backup files from rustfmt
+**/*.rs.bk
+
+# Profiling / flamegraph artifacts
+perf.data
+perf.data.old
+flamegraph.svg
+*.profraw
+
+# Criterion benchmark output (keep results out of VCS)
+/target/criterion
+
+# Editor / OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Local example/backtest data dumps (keep the repo lean; ship tiny fixtures only)
+/data/*.parquet
+/data/*.csv
+!/data/fixtures/
+
+# Playground run artefacts (saved RunReport JSON, etc.) — large and reproducible.
+/run_artefacts/
+
+# Playground market-data cache (downloaded klines, Feather) — large and reproducible.
+/market_data/
+
+# Stray rustc scratch outputs — produced by compiling a .rs file directly with
+# `rustc` instead of through cargo (which writes to the ignored target/). These
+# should never exist in-tree.
+/rust_out
+/librust_out.rlib
+

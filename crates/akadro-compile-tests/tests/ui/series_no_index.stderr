@@ -1,0 +1,5 @@
+error[E0608]: cannot index into a value of type `Series<'_, Price>`
+  --> tests/ui/series_no_index.rs:14:23
+   |
+14 |         let _ = series[0usize];
+   |                       ^^^^^^^^
