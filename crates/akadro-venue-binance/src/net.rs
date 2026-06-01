@@ -90,3 +90,100 @@ pub fn unix_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
+
+// --- Binance Vision bulk-historical downloader -------------------------------
+//
+// Requires `net` (this whole module is `net`-gated) + `vision-zip`; the
+// `vision-net` feature enables both. The pure parse/verify/unzip logic lives in
+// `crate::vision`; this is only the live-IO half.
+
+/// Downloads and decodes Binance Vision bulk-historical archives over HTTP
+/// (`reqwest::blocking` — no tokio). The pure parsing/verification lives in
+/// [`crate::vision`]; this is the live-IO half (exercised by the `#[ignore]`d
+/// live test, excluded from the coverage gate).
+#[cfg(all(feature = "net", feature = "vision-zip"))]
+#[derive(Debug)]
+pub struct VisionDownloader {
+    client: reqwest::blocking::Client,
+    base: String,
+}
+
+#[cfg(all(feature = "net", feature = "vision-zip"))]
+impl VisionDownloader {
+    /// Build a downloader against [`VISION_BASE`](crate::vision::VISION_BASE).
+    ///
+    /// # Errors
+    /// [`BinanceError::Transport`] if the HTTP client cannot be built.
+    pub fn new() -> Result<Self, BinanceError> {
+        Self::with_base(crate::vision::VISION_BASE)
+    }
+
+    /// Build a downloader against a custom base host (e.g. a mirror).
+    ///
+    /// # Errors
+    /// [`BinanceError::Transport`] if the HTTP client cannot be built.
+    pub fn with_base(base: impl Into<String>) -> Result<Self, BinanceError> {
+        // Generous: a monthly 1-minute archive is a few MB. `from_mins` is still
+        // unstable on the MSRV, so spell the timeout in seconds.
+        #[allow(clippy::duration_suboptimal_units)]
+        let timeout = std::time::Duration::from_secs(60);
+        let client = reqwest::blocking::Client::builder()
+            .timeout(timeout)
+            .user_agent("akadro-venue-binance")
+            .build()
+            .map_err(|e| BinanceError::Transport(e.to_string()))?;
+        Ok(VisionDownloader {
+            client,
+            base: base.into(),
+        })
+    }
+
+    fn get_bytes(&self, url: &str) -> Result<Vec<u8>, BinanceError> {
+        let resp = self
+            .client
+            .get(url)
+            .send()
+            .map_err(|e| BinanceError::Transport(e.to_string()))?;
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(BinanceError::Transport(format!(
+                "vision HTTP {status} for {url}"
+            )));
+        }
+        resp.bytes()
+            .map(|b| b.to_vec())
+            .map_err(|e| BinanceError::Transport(e.to_string()))
+    }
+
+    /// Download one archive, optionally verify its `.CHECKSUM` (SHA-256), and
+    /// return the decompressed CSV body. A missing file surfaces as a
+    /// [`BinanceError::Transport`] carrying the HTTP status, so callers can fall
+    /// back monthly→daily for the most recent (not-yet-published) period.
+    ///
+    /// # Errors
+    /// [`BinanceError::Transport`] on a network error or non-2xx (incl. 404);
+    /// [`BinanceError::Parse`] on a checksum mismatch or a bad archive.
+    pub fn fetch_csv(
+        &self,
+        granularity: crate::vision::VisionGranularity,
+        symbol: &str,
+        interval: &str,
+        date_token: &str,
+        verify_checksum: bool,
+    ) -> Result<String, BinanceError> {
+        let url =
+            crate::vision::vision_zip_url(&self.base, granularity, symbol, interval, date_token);
+        let zip_bytes = self.get_bytes(&url)?;
+        // Download the `.CHECKSUM` body (if verifying); the pure verify+unzip then
+        // lives in `crate::vision::verify_and_unzip` (unit-tested without network).
+        let checksum_body = if verify_checksum {
+            Some(
+                String::from_utf8(self.get_bytes(&crate::vision::vision_checksum_url(&url))?)
+                    .map_err(|e| BinanceError::Parse(format!("vision checksum utf8: {e}")))?,
+            )
+        } else {
+            None
+        };
+        crate::vision::verify_and_unzip(&zip_bytes, checksum_body.as_deref())
+    }
+}

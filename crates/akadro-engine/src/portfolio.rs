@@ -112,6 +112,15 @@ pub(crate) struct Portfolio {
     /// which is exactly the signal the replay oracle gates on (i3).
     liquidation_pnl: Money,
     positions: Vec<Position>,
+    /// Instruments that currently hold a non-zero position. Maintained in `settle`
+    /// (the sole position-net mutation point), so `mark_to_market` can sum equity
+    /// over only the open positions instead of scanning the whole catalog every
+    /// bar — O(open) rather than O(`n_instruments`), which matters a lot for a
+    /// many-instrument venue catalogue (e.g. ~1200 OKX spot pairs) traded by a
+    /// few-instrument strategy. A flat position contributes 0 to equity, so this is
+    /// behaviour-identical; the only invariant that matters is "no open position is
+    /// missing" (a stale-flat entry would merely add 0).
+    held: Vec<InstrumentId>,
     fills: Vec<FillRecord>,
     /// Ids of orders currently working at the venue (accepted, not yet terminal).
     /// Derived purely from the account stream (D5).
@@ -131,6 +140,7 @@ impl Portfolio {
             funding_net: Money::ZERO,
             liquidation_pnl: Money::ZERO,
             positions: vec![Position::default(); n_instruments],
+            held: Vec::new(),
             fills: Vec::new(),
             open: Vec::new(),
             last_funding_rate: vec![None; n_instruments],
@@ -235,8 +245,20 @@ impl Portfolio {
             .iter()
             .fold(Money::ZERO, |acc, c| acc.saturating_add(c.amount));
         if let Some(pos) = self.positions.get_mut(instrument.index() as usize) {
+            let was_open = pos.net != 0;
             let realized = pos.apply_fill(side, price, qty);
+            let now_open = pos.net != 0;
             self.realized = self.realized.saturating_add(realized);
+            // Keep the open-position set in step with the net crossing 0 (the only
+            // place positions change). `held` may briefly retain a flat instrument
+            // between transitions only via this path, which is harmless (adds 0).
+            if was_open != now_open {
+                if now_open {
+                    self.held.push(instrument);
+                } else {
+                    self.held.retain(|h| *h != instrument);
+                }
+            }
         }
         // Cash: pay the notional on a buy, receive it on a sell, then fees.
         let notional = price.notional(qty).raw();
@@ -273,6 +295,13 @@ impl Portfolio {
     /// Total costs charged over the run: trading fees plus net funding.
     pub(crate) fn net_costs(&self) -> Money {
         self.trading_fees.saturating_add(self.funding_net)
+    }
+
+    /// Instruments that currently hold a (non-zero) position — the set
+    /// `mark_to_market` sums over. May transiently include a just-flattened
+    /// instrument; that is harmless (it marks to 0).
+    pub(crate) fn open_positions(&self) -> &[InstrumentId] {
+        &self.held
     }
 
     pub(crate) fn net_qty(&self, instrument: InstrumentId) -> Qty {

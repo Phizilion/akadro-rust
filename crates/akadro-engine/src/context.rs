@@ -394,8 +394,9 @@ impl<'bar> Ctx<'bar> {
         self.portfolio.net_qty(instrument)
     }
 
-    /// The most recently **settled** funding rate (signed basis points) for
-    /// `instrument`, from the account-event stream
+    /// The most recently **settled** funding rate for `instrument`, signed, at
+    /// [`FUNDING_RATE_SCALE`](akadro_core::FUNDING_RATE_SCALE) (`rate · 10⁻⁸`, so
+    /// `10_000` is one basis point), from the account-event stream
     /// ([`AccountEvent::FundingSettlement`](akadro_core::AccountEvent)), or `None`
     /// if none has settled yet. This is the last *settled* rate (backward-looking),
     /// so it is look-ahead-safe and identical in backtest and live (D5).

@@ -6,8 +6,12 @@
 //! on `akadro-core`, so it adds a venue with **zero** changes to the engine or
 //! strategies (the open/closed goal).
 //!
-//! It provides an [`OkxCatalog`] (`/api/v5/public/instruments` → [`InstrumentSpec`]),
-//! an [`OkxCandleFeed`] ([`DataSource`] over `/api/v5/market/candles`), and an
+//! It provides an [`OkxCatalog`] (`/api/v5/public/instruments` → [`InstrumentSpec`],
+//! fetched via [`OkxCatalog::fetch`]), an [`OkxCandleFeed`] ([`DataSource`] over
+//! `/api/v5/market/candles`, or — with [`OkxCandleFeed::with_range`] — paged
+//! `/api/v5/market/history-candles` for an arbitrary historical window), perpetual
+//! **funding** history ([`fetch_funding_history`] → a
+//! `SimulatedExchange::with_funding_schedule` schedule), and an
 //! [`OkxExec`] ([`ExecutionClient`] that signs and submits `/api/v5/trade/order`).
 //! Logic talks to OKX through the mockable [`Transport`] seam, so signing, parsing
 //! and normalization are fixture-tested with no network; the live `reqwest`
@@ -207,8 +211,8 @@ pub fn raw_to_decimal(raw: i64, scale: u32) -> String {
     if neg { format!("-{s}") } else { s }
 }
 
-/// Milliseconds in an OKX bar token (`"1m"`, `"15m"`, `"1H"`, `"4H"`, `"1D"`,
-/// `"1W"`); `0` if unrecognized (then a candle is stamped at its open time).
+/// Milliseconds in an OKX bar token (`"1s"`, `"1m"`, `"15m"`, `"1H"`, `"4H"`,
+/// `"1D"`, `"1W"`); `0` if unrecognized (then a candle is stamped at its open time).
 #[must_use]
 pub fn bar_millis(bar: &str) -> i64 {
     // Strip an optional `utc` suffix OKX appends to some day/week bars.
@@ -219,6 +223,7 @@ pub fn bar_millis(bar: &str) -> i64 {
     let (num, unit) = bar.split_at(bar.len().saturating_sub(1));
     let n: i64 = num.parse().unwrap_or(0);
     let unit_ms = match unit {
+        "s" => 1_000, // OKX supports 1-second candles (spot)
         "m" => 60_000,
         "H" => 3_600_000,
         "D" => 86_400_000,
@@ -293,6 +298,37 @@ pub struct OkxCatalog {
 }
 
 impl OkxCatalog {
+    /// Fetch `/api/v5/public/instruments?instType={SPOT|SWAP}` over `transport` and
+    /// parse it into a catalogue (see [`from_instruments`](Self::from_instruments)).
+    /// This is the reusable connector entry point — callers never hand-build the URL
+    /// or touch the response body.
+    ///
+    /// # Errors
+    /// [`OkxError::Transport`] on a transport failure or a non-2xx status;
+    /// [`OkxError::Parse`] on malformed JSON.
+    pub fn fetch<T: Transport>(
+        transport: &mut T,
+        base_url: &str,
+        inst_type: InstType,
+    ) -> Result<Self, OkxError> {
+        let resp = transport.send(&HttpRequest {
+            method: Method::Get,
+            url: format!(
+                "{base_url}/api/v5/public/instruments?instType={}",
+                inst_type.query()
+            ),
+            body: None,
+            headers: Vec::new(),
+        })?;
+        if !resp.is_success() {
+            return Err(OkxError::Transport(format!(
+                "instruments HTTP {}",
+                resp.status
+            )));
+        }
+        Self::from_instruments(&resp.body, inst_type)
+    }
+
     /// Parse `/api/v5/public/instruments?instType={SPOT|SWAP}` into a catalogue.
     /// Only `live` instruments are kept; base/quote are derived from the `instId`
     /// (`BTC-USDT` / `BTC-USDT-SWAP`). Each gets a dense [`InstrumentId`].
@@ -441,8 +477,169 @@ pub fn parse_candles(
     Ok(bars)
 }
 
-/// A [`DataSource`] streaming OKX candles for one instrument (one fetch up to
-/// `limit`, OKX's `/market/candles` cap is 300).
+// --- funding-rate history ----------------------------------------------------
+
+/// Funding-rate fixed-point scale — re-exported from `akadro-core` so the connector
+/// and the engine's `mul_rate` charge cannot drift. Rates normalize to `1e-8`
+/// fractions (8 decimals): OKX's `"0.0001"` (0.01% per settlement) → `10_000` (= 1
+/// bp), and a sub-bp `"0.0000466"` → `4_669` instead of rounding to `0` as a
+/// basis-point scale would. See `SimulatedExchange::with_funding_schedule`.
+pub use akadro_core::FUNDING_RATE_SCALE;
+
+#[derive(Deserialize)]
+struct FundingHistResp {
+    #[serde(default)]
+    data: Vec<FundingHistRow>,
+}
+
+#[derive(Deserialize)]
+struct FundingHistRow {
+    #[serde(rename = "fundingRate")]
+    funding_rate: String,
+    #[serde(rename = "fundingTime")]
+    funding_time: String, // OKX returns the epoch-ms as a string
+}
+
+/// Parse `/api/v5/public/funding-rate-history` into a `(timestamp, rate)` schedule
+/// for `SimulatedExchange::with_funding_schedule`, sorted ascending by time.
+/// `fundingRate` is a decimal fraction normalized to [`FUNDING_RATE_SCALE`] (`1e-8`),
+/// so OKX's routinely **sub-bp** rates (e.g. `0.0000466` = 0.47 bp → `4_669`) are
+/// preserved and accrue, rather than rounding to `0` at basis-point granularity. OKX
+/// returns newest-first, so the result is re-sorted.
+///
+/// # Errors
+/// [`OkxError::Parse`] on bad JSON, a bad rate, or a bad/overflowing time.
+pub fn parse_funding_rate_history(json: &str) -> Result<Vec<(Timestamp, i64)>, OkxError> {
+    let resp: FundingHistResp =
+        serde_json::from_str(json).map_err(|e| OkxError::Parse(e.to_string()))?;
+    let mut out: Vec<(Timestamp, i64)> =
+        resp.data
+            .into_iter()
+            .map(|r| {
+                let ms: i64 = r.funding_time.trim().parse().map_err(|_| {
+                    OkxError::Parse(format!("bad fundingTime {:?}", r.funding_time))
+                })?;
+                let ns = ms
+                    .checked_mul(1_000_000)
+                    .ok_or_else(|| OkxError::Parse("fundingTime overflow".into()))?;
+                Ok((
+                    Timestamp::from_nanos(ns),
+                    decimal_to_raw(&r.funding_rate, FUNDING_RATE_SCALE)?,
+                ))
+            })
+            .collect::<Result<_, OkxError>>()?;
+    out.sort_by_key(|(t, _)| t.as_nanos());
+    Ok(out)
+}
+
+/// Fetch `/api/v5/public/funding-rate-history` for `inst_id` over `transport` and
+/// parse it into an ascending `(timestamp, rate)` schedule for
+/// `SimulatedExchange::with_funding_schedule`. `limit` caps the number of past
+/// settlements returned (OKX's own cap is 100, applied here). The reusable
+/// connector entry point — callers never build the URL or touch the body.
+///
+/// Rates are at [`FUNDING_RATE_SCALE`] (`1e-8`), so OKX's typically **sub-bp** rates
+/// (e.g. `0.0000466` = 0.47 bp) accrue correctly when fed to `with_funding_schedule`
+/// — they are no longer rounded to `0` as they were under the old basis-point scale.
+///
+/// # Errors
+/// [`OkxError::Transport`] on a transport failure or a non-2xx status;
+/// [`OkxError::Parse`] on malformed JSON.
+pub fn fetch_funding_history<T: Transport>(
+    transport: &mut T,
+    base_url: &str,
+    inst_id: &str,
+    limit: u32,
+) -> Result<Vec<(Timestamp, i64)>, OkxError> {
+    let resp = transport.send(&HttpRequest {
+        method: Method::Get,
+        url: format!(
+            "{base_url}/api/v5/public/funding-rate-history?instId={inst_id}&limit={}",
+            limit.min(100)
+        ),
+        body: None,
+        headers: Vec::new(),
+    })?;
+    if !resp.is_success() {
+        return Err(OkxError::Transport(format!(
+            "funding-rate-history HTTP {}",
+            resp.status
+        )));
+    }
+    parse_funding_rate_history(&resp.body)
+}
+
+/// Page `/api/v5/public/funding-rate-history` back over `max_pages` (100/page) into
+/// one ascending [`FUNDING_RATE_SCALE`] schedule — enough to cover a long backtest
+/// window, where a single page (~33 days at the 8h cadence) under-covers funding.
+/// OKX pages by the `after=<ms>` cursor (records strictly older than it); each page
+/// advances the cursor to the oldest settlement seen. Stops early on an empty page;
+/// de-duplicates by settlement time. The reusable connector entry point.
+///
+/// # Errors
+/// [`OkxError::Transport`] on a transport failure or a non-2xx status;
+/// [`OkxError::Parse`] on malformed JSON.
+pub fn fetch_funding_history_paged<T: Transport>(
+    transport: &mut T,
+    base_url: &str,
+    inst_id: &str,
+    max_pages: u32,
+) -> Result<Vec<(Timestamp, i64)>, OkxError> {
+    let mut all: Vec<(Timestamp, i64)> = Vec::new();
+    let mut after: Option<i64> = None; // ms cursor; None = most-recent page
+    for _ in 0..max_pages.max(1) {
+        let mut url =
+            format!("{base_url}/api/v5/public/funding-rate-history?instId={inst_id}&limit=100");
+        if let Some(a) = after {
+            use core::fmt::Write as _;
+            let _ = write!(url, "&after={a}");
+        }
+        let resp = transport.send(&HttpRequest {
+            method: Method::Get,
+            url,
+            body: None,
+            headers: Vec::new(),
+        })?;
+        if !resp.is_success() {
+            return Err(OkxError::Transport(format!(
+                "funding-rate-history HTTP {}",
+                resp.status
+            )));
+        }
+        let page = parse_funding_rate_history(&resp.body)?; // ascending
+        let Some((oldest, _)) = page.first().copied() else {
+            break;
+        };
+        let oldest_ms = oldest.as_nanos() / 1_000_000;
+        all.extend(page);
+        if after.is_some_and(|prev| oldest_ms >= prev) {
+            break; // no backward progress (duplicate / non-monotonic page)
+        }
+        after = Some(oldest_ms); // next page: strictly older
+    }
+    all.sort_by_key(|(t, _)| t.as_nanos());
+    all.dedup_by_key(|(t, _)| t.as_nanos());
+    Ok(all)
+}
+
+/// The settlement period (milliseconds) implied by a funding `schedule`: the
+/// smallest positive gap between consecutive settlements, or OKX's standard 8h
+/// (`28_800_000`) when there are fewer than two points to infer it from. Divide by
+/// the bar length to get `with_funding_schedule`'s `interval_bars`.
+#[must_use]
+pub fn funding_period_ms(schedule: &[(Timestamp, i64)]) -> i64 {
+    schedule
+        .windows(2)
+        .map(|w| w[1].0.as_nanos() / 1_000_000 - w[0].0.as_nanos() / 1_000_000)
+        .filter(|d| *d > 0)
+        .min()
+        .unwrap_or(28_800_000)
+}
+
+/// A [`DataSource`] streaming OKX candles for one instrument. By default it does a
+/// single `/market/candles` fetch (the recent window, up to `limit`, cap 300); set
+/// [`with_range`](Self::with_range) to instead page `/market/history-candles`
+/// (newest→oldest, 100/page) back to cover an arbitrary `[start, end)` window.
 pub struct OkxCandleFeed<T> {
     transport: T,
     base_url: String,
@@ -452,6 +649,14 @@ pub struct OkxCandleFeed<T> {
     price_scale: u32,
     qty_scale: u32,
     limit: u32,
+    /// `Some((start_ms, end_ms))` → page `history-candles` over `[start, end)`;
+    /// `None` → a single recent `/market/candles` fetch.
+    range: Option<(i64, i64)>,
+    /// Courtesy delay between `history-candles` pages (rate-limit politeness);
+    /// also the unit of the bounded 429 back-off. `0` in tests.
+    page_delay: std::time::Duration,
+    /// Bounded retries on a `429` (rate-limited) page before giving up.
+    max_retries: u32,
     buffer: std::collections::VecDeque<Bar>,
     fetched: bool,
 }
@@ -477,19 +682,51 @@ impl<T: Transport> OkxCandleFeed<T> {
             price_scale,
             qty_scale,
             limit: 100,
+            range: None,
+            page_delay: std::time::Duration::from_millis(120),
+            max_retries: 8,
             buffer: std::collections::VecDeque::new(),
             fetched: false,
         }
     }
 
-    /// Set the page size (OKX caps `/market/candles` at 300).
+    /// Set the page size (OKX caps `/market/candles` at 300, `history-candles` at 100).
     #[must_use]
     pub fn with_limit(mut self, limit: u32) -> Self {
         self.limit = limit.min(300);
         self
     }
 
+    /// Backfill an arbitrary historical window `[start_ms, end_ms)` (epoch-ms on the
+    /// candle **open** time) by paging `/market/history-candles` newest→oldest
+    /// instead of the single recent `/market/candles` fetch — the way to pull, say,
+    /// a full day of `1s` bars. The page size is clamped to OKX's 100 cap and the
+    /// returned bars are ascending, de-duplicated, and close-stamped exactly like
+    /// [`parse_candles`].
+    #[must_use]
+    pub fn with_range(mut self, start_ms: i64, end_ms: i64) -> Self {
+        self.range = Some((start_ms, end_ms));
+        self.limit = self.limit.min(100);
+        self
+    }
+
+    /// Override the inter-page courtesy delay (default 120 ms). Set to
+    /// [`Duration::ZERO`](std::time::Duration::ZERO) in tests to page without sleeping.
+    #[must_use]
+    pub fn with_page_delay(mut self, delay: std::time::Duration) -> Self {
+        self.page_delay = delay;
+        self
+    }
+
     fn fetch(&mut self) -> Result<(), OkxError> {
+        match self.range {
+            Some((start_ms, end_ms)) => self.fetch_range(start_ms, end_ms),
+            None => self.fetch_recent(),
+        }
+    }
+
+    /// One recent `/market/candles` page (up to `limit`, ≤300).
+    fn fetch_recent(&mut self) -> Result<(), OkxError> {
         let url = format!(
             "{}/api/v5/market/candles?instId={}&bar={}&limit={}",
             self.base_url, self.inst_id, self.bar, self.limit
@@ -513,6 +750,91 @@ impl<T: Transport> OkxCandleFeed<T> {
         self.buffer.extend(bars);
         Ok(())
     }
+
+    /// Page `/market/history-candles` newest→oldest until `[start_ms, end_ms)` is
+    /// covered, then buffer the window ascending + de-duplicated. `after` is OKX's
+    /// exclusive cursor on the candle open time, so each page advances it to the
+    /// oldest open seen. A leading-page error surfaces; a mid-range error keeps the
+    /// pages already fetched (so a transient failure deep in a backfill is not fatal).
+    fn fetch_range(&mut self, start_ms: i64, end_ms: i64) -> Result<(), OkxError> {
+        let bar_ms = bar_millis(&self.bar);
+        if bar_ms == 0 {
+            return Err(OkxError::Parse(format!("unknown bar {:?}", self.bar)));
+        }
+        // One knob: a zero `page_delay` (tests) also means a zero 429 back-off, so
+        // the paging loop runs without ever sleeping.
+        let backoff = if self.page_delay.is_zero() {
+            std::time::Duration::ZERO
+        } else {
+            std::time::Duration::from_secs(2)
+        };
+        let mut all: Vec<Bar> = Vec::new();
+        let mut cursor = end_ms; // OKX `after` is exclusive on the OPEN ts
+        let mut retries = 0u32;
+        loop {
+            let url = format!(
+                "{}/api/v5/market/history-candles?instId={}&bar={}&after={}&limit={}",
+                self.base_url, self.inst_id, self.bar, cursor, self.limit
+            );
+            let resp = self.transport.send(&HttpRequest {
+                method: Method::Get,
+                url,
+                body: None,
+                headers: Vec::new(),
+            })?;
+            if !resp.is_success() {
+                if resp.status == 429 && retries < self.max_retries {
+                    retries += 1;
+                    if !backoff.is_zero() {
+                        std::thread::sleep(backoff);
+                    }
+                    continue;
+                }
+                if all.is_empty() {
+                    return Err(OkxError::Transport(format!(
+                        "history-candles HTTP {}",
+                        resp.status
+                    )));
+                }
+                break; // mid-range error: keep the pages already fetched
+            }
+            retries = 0;
+            let page = parse_candles(
+                &resp.body,
+                self.instrument,
+                self.price_scale,
+                self.qty_scale,
+                &self.bar,
+            )?;
+            if page.is_empty() {
+                break;
+            }
+            // Pages are ascending + close-stamped; the oldest OPEN ts drives `after`.
+            let oldest_open_ms =
+                page.first().expect("non-empty").ts.as_nanos() / 1_000_000 - bar_ms;
+            all.extend(page);
+            if oldest_open_ms <= start_ms {
+                break;
+            }
+            if oldest_open_ms >= cursor {
+                break; // no backward progress (duplicate / non-monotonic page)
+            }
+            cursor = oldest_open_ms;
+            if !self.page_delay.is_zero() {
+                std::thread::sleep(self.page_delay);
+            }
+        }
+        all.sort_by_key(|b| b.ts.as_nanos());
+        all.dedup_by_key(|b| b.ts.as_nanos());
+        self.buffer = all
+            .into_iter()
+            .filter(|b| {
+                let open = b.ts.as_nanos() / 1_000_000 - bar_ms;
+                open >= start_ms && open < end_ms
+            })
+            .collect();
+        Ok(())
+    }
 }
 
 impl<T: Transport> DataSource for OkxCandleFeed<T> {
@@ -532,6 +854,7 @@ impl<T> core::fmt::Debug for OkxCandleFeed<T> {
         f.debug_struct("OkxCandleFeed")
             .field("inst_id", &self.inst_id)
             .field("bar", &self.bar)
+            .field("range", &self.range)
             .field("buffered", &self.buffer.len())
             .finish_non_exhaustive()
     }
@@ -834,6 +1157,7 @@ mod tests {
         assert!(decimal_to_raw("x", 2).is_err());
         assert_eq!(raw_to_decimal(12345, 2), "123.45");
         assert_eq!(raw_to_decimal(50, 0), "50");
+        assert_eq!(bar_millis("1s"), 1_000); // OKX 1-second candles
         assert_eq!(bar_millis("1m"), 60_000);
         assert_eq!(bar_millis("4H"), 14_400_000);
         assert_eq!(bar_millis("1D"), 86_400_000);
@@ -880,6 +1204,42 @@ mod tests {
     }
 
     #[test]
+    fn one_second_candle_stamps_at_close_not_open() {
+        // OKX 1s candle, open ts 1700000000000 ms → must stamp at close = open + 1s,
+        // not at open (the bug a missing "s" unit caused).
+        let json =
+            r#"{"code":"0","data":[["1700000000000","100","100","100","100","1","1","1","1"]]}"#;
+        let bars = parse_candles(json, InstrumentId::new(0), 0, 0, "1s").unwrap();
+        assert_eq!(bars[0].ts.as_nanos(), 1_700_000_001_000_000_000); // open + 1000ms, in ns
+    }
+
+    #[test]
+    fn funding_rate_history_parses_to_fine_scale_sorted() {
+        // OKX returns newest-first; fundingTime is a ms string, fundingRate a decimal.
+        let json = r#"{"code":"0","data":[
+            {"fundingRate":"0.0001","fundingTime":"1780300800000","instId":"BTC-USDT-SWAP","realizedRate":"0.0001"},
+            {"fundingRate":"-0.0000466","fundingTime":"1780272000000","instId":"BTC-USDT-SWAP","realizedRate":"-0.0000466"}
+        ]}"#;
+        let sched = parse_funding_rate_history(json).unwrap();
+        assert_eq!(sched.len(), 2);
+        // Sorted ascending; at FUNDING_RATE_SCALE (1e-8): 0.0001 → 10_000 (= 1 bp),
+        // and the sub-bp -0.0000466 → -4_660 (preserved, not rounded to 0).
+        assert_eq!(
+            sched[0],
+            (Timestamp::from_nanos(1_780_272_000_000_000_000), -4_660)
+        );
+        assert_eq!(
+            sched[1],
+            (Timestamp::from_nanos(1_780_300_800_000_000_000), 10_000)
+        );
+        assert!(parse_funding_rate_history("not json").is_err());
+        assert!(
+            parse_funding_rate_history(r#"{"data":[{"fundingRate":"0.0001","fundingTime":"x"}]}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn candle_feed_streams_then_exhausts() {
         let body =
             r#"{"code":"0","data":[["1700000000000","100","100","100","100","1","1","1","1"]]}"#;
@@ -899,6 +1259,339 @@ mod tests {
         assert!(feed.next_event().is_some());
         assert!(feed.next_event().is_none());
         assert!(format!("{feed:?}").contains("OkxCandleFeed"));
+    }
+
+    #[test]
+    fn catalog_fetch_via_transport() {
+        let mut t = MockTransport::new(vec![HttpResponse {
+            status: 200,
+            body: INSTRUMENTS.into(),
+        }]);
+        let cat = OkxCatalog::fetch(&mut t, "http://x", InstType::Spot).unwrap();
+        assert!(cat.id_of("BTC-USDT").is_some());
+        // The connector built the right public-instruments URL.
+        assert!(
+            t.sent[0]
+                .url
+                .contains("/api/v5/public/instruments?instType=SPOT")
+        );
+        // A non-2xx status is a Transport error, not a silent empty catalogue.
+        let mut bad = MockTransport::new(vec![HttpResponse {
+            status: 503,
+            body: String::new(),
+        }]);
+        assert!(OkxCatalog::fetch(&mut bad, "http://x", InstType::Spot).is_err());
+    }
+
+    /// A `history-candles` page: `opens` are open-times in ms, newest-first (as OKX
+    /// returns them), one flat 1-minute candle each.
+    fn hist_page(opens: &[i64]) -> HttpResponse {
+        let rows: Vec<String> = opens
+            .iter()
+            .map(|o| format!(r#"["{o}","100","100","100","100","1","1","1","1"]"#))
+            .collect();
+        HttpResponse {
+            status: 200,
+            body: format!(r#"{{"code":"0","data":[{}]}}"#, rows.join(",")),
+        }
+    }
+
+    #[test]
+    fn range_feed_pages_window_ascending() {
+        // Window [0, 300_000) = five 1m bars (opens 0,60k,120k,180k,240k). OKX pages
+        // newest→oldest, 2 per page here, then an empty page terminates.
+        let feed = OkxCandleFeed::new(
+            MockTransport::new(vec![
+                hist_page(&[240_000, 180_000]),
+                hist_page(&[120_000, 60_000]),
+                hist_page(&[0]),
+                hist_page(&[]),
+            ]),
+            "http://x",
+            "BTC-USDT",
+            InstrumentId::new(0),
+            "1m",
+            2,
+            0,
+        )
+        .with_range(0, 300_000)
+        .with_page_delay(std::time::Duration::ZERO);
+        let mut feed = feed;
+        let mut bars = Vec::new();
+        while let Some(Event::Bar(b)) = feed.next_event() {
+            bars.push(b);
+        }
+        assert_eq!(bars.len(), 5);
+        // Ascending, close-stamped at open + 60s.
+        assert_eq!(bars[0].ts.as_nanos(), 60_000_000_000); // open 0 + 60s
+        assert_eq!(bars[4].ts.as_nanos(), 300_000_000_000); // open 240k + 60s
+        for w in bars.windows(2) {
+            assert!(w[0].ts.as_nanos() < w[1].ts.as_nanos());
+        }
+    }
+
+    #[test]
+    fn range_feed_filters_to_window_and_dedups() {
+        // A page reaches past `start`; bars with open < start (here -60_000) and a
+        // duplicate open are dropped, leaving only [60_000, 120_000).
+        let feed = OkxCandleFeed::new(
+            MockTransport::new(vec![
+                hist_page(&[120_000, 60_000, 60_000, 0, -60_000]),
+                hist_page(&[]),
+            ]),
+            "http://x",
+            "BTC-USDT",
+            InstrumentId::new(0),
+            "1m",
+            2,
+            0,
+        )
+        .with_range(60_000, 180_000)
+        .with_page_delay(std::time::Duration::ZERO);
+        let mut feed = feed;
+        let mut n = 0;
+        while feed.next_event().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 2); // opens 60k & 120k; 0 and -60k out of window, dup 60k collapsed
+    }
+
+    #[test]
+    fn range_feed_retries_on_429_then_yields() {
+        // A leading 429 must be retried (zero back-off at page_delay 0), not fatal.
+        let feed = OkxCandleFeed::new(
+            MockTransport::new(vec![
+                HttpResponse {
+                    status: 429,
+                    body: String::new(),
+                },
+                hist_page(&[0]),
+                hist_page(&[]),
+            ]),
+            "http://x",
+            "BTC-USDT",
+            InstrumentId::new(0),
+            "1m",
+            2,
+            0,
+        )
+        .with_range(0, 60_000)
+        .with_page_delay(std::time::Duration::ZERO);
+        let mut feed = feed;
+        assert!(feed.next_event().is_some()); // survived the 429
+        assert!(feed.next_event().is_none());
+    }
+
+    #[test]
+    fn range_feed_leading_error_surfaces_as_none() {
+        // A non-429 error on the very first page (nothing buffered) yields no events.
+        let feed = OkxCandleFeed::new(
+            MockTransport::new(vec![HttpResponse {
+                status: 500,
+                body: String::new(),
+            }]),
+            "http://x",
+            "BTC-USDT",
+            InstrumentId::new(0),
+            "1m",
+            2,
+            0,
+        )
+        .with_range(0, 60_000)
+        .with_page_delay(std::time::Duration::ZERO);
+        let mut feed = feed;
+        assert!(feed.next_event().is_none());
+    }
+
+    #[test]
+    fn range_feed_unknown_bar_errors() {
+        let feed = OkxCandleFeed::new(
+            MockTransport::new(vec![hist_page(&[0])]),
+            "http://x",
+            "BTC-USDT",
+            InstrumentId::new(0),
+            "weird", // bar_millis → 0
+            2,
+            0,
+        )
+        .with_range(0, 60_000)
+        .with_page_delay(std::time::Duration::ZERO);
+        let mut feed = feed;
+        assert!(feed.next_event().is_none()); // bar_ms == 0 → fetch errors
+    }
+
+    fn okx_range_feed(
+        responses: Vec<HttpResponse>,
+        start: i64,
+        end: i64,
+    ) -> OkxCandleFeed<MockTransport> {
+        OkxCandleFeed::new(
+            MockTransport::new(responses),
+            "http://x",
+            "BTC-USDT",
+            InstrumentId::new(0),
+            "1m",
+            2,
+            0,
+        )
+        .with_range(start, end)
+        .with_page_delay(std::time::Duration::ZERO)
+    }
+
+    fn ok_page(opens_ms: &[i64]) -> HttpResponse {
+        HttpResponse {
+            status: 200,
+            body: hist_page(opens_ms).body,
+        }
+    }
+
+    #[test]
+    fn range_feed_guards_against_no_progress() {
+        // A page whose oldest open does not move the `after` cursor back must NOT
+        // loop forever: the same page returned twice terminates via the guard.
+        let p = || ok_page(&[1_700_000_300_000, 1_700_000_360_000]);
+        let mut feed = okx_range_feed(vec![p(), p()], 1_700_000_000_000, 1_700_000_600_000);
+        let mut n = 0;
+        while feed.next_event().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 2); // de-duplicated; the guard stopped the stall
+    }
+
+    #[test]
+    fn range_feed_429_exhausted_yields_none() {
+        // 429 past max_retries on the first page → error → empty feed (not a hang).
+        let r429 = || HttpResponse {
+            status: 429,
+            body: String::new(),
+        };
+        let mut feed = okx_range_feed(
+            (0..10).map(|_| r429()).collect(),
+            1_700_000_000_000,
+            1_700_000_060_000,
+        );
+        assert!(feed.next_event().is_none());
+    }
+
+    #[test]
+    fn range_feed_mid_range_error_keeps_fetched_pages() {
+        // Page 1 succeeds (oldest > start → would page again), then a non-429 error:
+        // the already-fetched page is kept, not discarded.
+        let mut feed = okx_range_feed(
+            vec![
+                ok_page(&[1_700_000_300_000, 1_700_000_360_000]),
+                HttpResponse {
+                    status: 500,
+                    body: String::new(),
+                },
+            ],
+            1_700_000_000_000,
+            1_700_000_600_000,
+        );
+        let mut n = 0;
+        while feed.next_event().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 2); // page 1 retained despite the mid-range 500
+    }
+
+    #[test]
+    fn funding_history_fetch_and_period() {
+        // Three 8h-apart settlements (newest-first, as OKX returns).
+        let body = r#"{"code":"0","data":[
+            {"fundingRate":"0.0001","fundingTime":"1780300800000"},
+            {"fundingRate":"0.0002","fundingTime":"1780272000000"},
+            {"fundingRate":"-0.0001","fundingTime":"1780243200000"}
+        ]}"#;
+        let mut t = MockTransport::new(vec![HttpResponse {
+            status: 200,
+            body: body.into(),
+        }]);
+        let sched = fetch_funding_history(&mut t, "http://x", "BTC-USDT-SWAP", 100).unwrap();
+        assert_eq!(sched.len(), 3);
+        assert!(
+            t.sent[0]
+                .url
+                .contains("funding-rate-history?instId=BTC-USDT-SWAP")
+        );
+        assert_eq!(funding_period_ms(&sched), 28_800_000); // 8h
+        // Fallbacks when the period can't be inferred.
+        assert_eq!(funding_period_ms(&[]), 28_800_000);
+        assert_eq!(
+            funding_period_ms(&[(Timestamp::from_nanos(0), 1)]),
+            28_800_000
+        );
+        let mut bad = MockTransport::new(vec![HttpResponse {
+            status: 500,
+            body: String::new(),
+        }]);
+        assert!(fetch_funding_history(&mut bad, "http://x", "X", 100).is_err());
+    }
+
+    #[test]
+    fn funding_history_paged_walks_after_cursor() {
+        // Two pages (newest-first within each), then an empty page terminates.
+        let page1 = r#"{"code":"0","data":[
+            {"fundingRate":"0.0001","fundingTime":"1780300800000"},
+            {"fundingRate":"0.0002","fundingTime":"1780272000000"}
+        ]}"#;
+        let page2 = r#"{"code":"0","data":[
+            {"fundingRate":"-0.0001","fundingTime":"1780243200000"},
+            {"fundingRate":"0.0003","fundingTime":"1780214400000"}
+        ]}"#;
+        let empty = r#"{"code":"0","data":[]}"#;
+        let mut t = MockTransport::new(vec![
+            HttpResponse {
+                status: 200,
+                body: page1.into(),
+            },
+            HttpResponse {
+                status: 200,
+                body: page2.into(),
+            },
+            HttpResponse {
+                status: 200,
+                body: empty.into(),
+            },
+        ]);
+        let sched = fetch_funding_history_paged(&mut t, "http://x", "BTC-USDT-SWAP", 10).unwrap();
+        assert_eq!(sched.len(), 4); // both pages concatenated
+        // Page 1 had no cursor; page 2 paged by `after` = page-1's oldest settlement.
+        assert!(!t.sent[0].url.contains("after="));
+        assert!(t.sent[1].url.contains("after=1780272000000"));
+        assert!(t.sent[2].url.contains("after=1780214400000"));
+        // Ascending + de-duplicated.
+        for w in sched.windows(2) {
+            assert!(w[0].0.as_nanos() < w[1].0.as_nanos());
+        }
+    }
+
+    #[test]
+    fn funding_history_paged_guards_no_progress_and_dedups() {
+        // The same page twice: the `after` cursor can't go older → terminate + dedup.
+        let page = r#"{"code":"0","data":[
+            {"fundingRate":"0.0001","fundingTime":"1780300800000"},
+            {"fundingRate":"0.0002","fundingTime":"1780272000000"}
+        ]}"#;
+        let mut t = MockTransport::new(vec![
+            HttpResponse {
+                status: 200,
+                body: page.into(),
+            },
+            HttpResponse {
+                status: 200,
+                body: page.into(),
+            },
+        ]);
+        let sched = fetch_funding_history_paged(&mut t, "http://x", "X", 10).unwrap();
+        assert_eq!(sched.len(), 2); // 2 unique settlements; guard stopped the stall
+        assert_eq!(t.sent.len(), 2); // page 1, then page 2 detects no progress → stop
+        // A non-2xx mid-paging surfaces as an error.
+        let mut bad = MockTransport::new(vec![HttpResponse {
+            status: 500,
+            body: String::new(),
+        }]);
+        assert!(fetch_funding_history_paged(&mut bad, "http://x", "X", 10).is_err());
     }
 
     struct SinkVec(Vec<AccountEvent>);

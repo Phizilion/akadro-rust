@@ -9,6 +9,166 @@ release.
 
 ## [0.1.1] - 2026-06-01
 
+### Added — venue feature parity: range backfill, pacing, catalog/funding fetch on every connector
+- Brought **Bybit** and **KuCoin** kline/candle feeds to parity with OKX/MEXC: historical
+  `with_range` back-fill (newest→oldest paging by the `end`/`endTime`/`endAt` cursor),
+  `with_page_delay` pacing + a bounded `429` back-off in `fetch_page`. Added
+  `BybitCatalog::fetch` / `KucoinCatalog::fetch` / `BinanceCatalog::fetch`(+`fetch_futures`)
+  so instruments load over the `Transport` seam — **no raw requests** in caller code (D18).
+- **Funding history is now paged on every connector** (`fetch_funding_history_paged`):
+  OKX (`after` cursor), Bybit (`endTime`), KuCoin (`to`), Binance (forward `startTime`),
+  joining MEXC — so a long backtest gets full-window funding, not just the recent ~100
+  settlements. Binance also gained `fetch_funding_history` (it had only `parse_funding_rate`).
+  All paging verified against the **live** venue schemas, all over `MockTransport`.
+- **Adversarially reviewed** (a 41-agent dynamic workflow across correctness / data-leakage
+  (D18) / DRY-SOLID-SoC-LoD-fail-fast / fixed-point / coverage): 28 confirmed findings, all
+  resolved — added the OKX back-fill **no-progress guard** (it could loop on a duplicate/
+  non-monotonic page; peers had it), removed `VisionBarSource::from_bars` (a venue connector
+  must not offer raw-`Bar` injection — D18), de-duplicated MEXC's interval table to one
+  source of truth, and added ~30 branch tests (guard / dedup / window-clip / 429-retry /
+  429-exhaustion / empty-page / mid-range-error / HTTP-error). The cross-venue paging/429-loop
+  duplication is a deliberate venue-crate-independence trade-off (a shared helper would need an
+  HTTP abstraction in `akadro-core`, breaking SoC); flagged, not refactored.
+- Closed loop: `cargo test --workspace` green · `clippy --workspace` 0 · `fmt` clean ·
+  `rustdoc -D warnings` clean · **replay trade-oracle + parity golden-master bit-identical**
+  (data-fetch changes don't touch the trade-sim path) · `llvm-cov` 97.3% line / **98.1%
+  region** (region clears the 98 gate; the sub-99 line is pre-existing exec/WS order paths +
+  the irreducible pacing-`sleep` lines, both itemized in §10). New standing rules recorded:
+  **D18 library-owns-data**, DRY/SOLID/SoC/LoD/fail-fast, and the production-ready gate (§7/§10).
+
+### Fixed — MEXC futures kline back-fill paged forward but the API anchors on `end`
+- `MexcFuturesKlineFeed::with_range` advanced a *forward* `start` cursor, but the MEXC
+  contract-kline endpoint caps each response at ~2000 bars **anchored on `end`** and
+  **ignores `start`** once the range exceeds the cap — so a long-range request just
+  re-fetched the most-recent ~2000 bars and stopped (a 1-year request yielded only
+  ~83 days). The back-fill now pages **newest→oldest** by moving the `end` cursor back
+  to just before the oldest bar received, clipped to `[start, end)` on open time —
+  verified by a `feed_pages_backward_by_end_cursor` regression test and a real
+  1-year `BTC_USDT` 1h download (8760 bars). This is a data-fetch fix; the trade-sim
+  path is untouched (replay oracle still MATCH).
+
+### Added — MEXC futures connector fetch helpers + playground `mexc-futures` venue
+- `akadro-venue-mexc`: `fetch_contracts` (`/api/v1/contract/detail`) and
+  `fetch_funding_history_paged` (pages `/contract/funding_rate/history`, 100/page, to
+  cover a long window) join `fetch_funding_history` — all public, over the `Transport`
+  seam, `MockTransport`-tested. The `playground` gains a `--venue mexc-futures`
+  (perpetual contract klines + default-on funding); a 1-year run pulled 1200 funding
+  settlements and accrued ~13.4k quote, replay-oracle MATCH.
+- **`MexcFuturesKlineFeed` page pacing** (`with_page_delay`, default 120 ms) + a
+  bounded `429` back-off in `fetch_page`, mirroring the OKX feed — so long, fine-
+  interval back-fills (many pages) stay within the venue's rate limit. Tests set the
+  delay to zero; a `feed_retries_on_429_then_yields` test covers the back-off path.
+  Verified by a 3-month 5m `BTC_USDT` download (26,496 bars over ~13 paced pages,
+  oracle MATCH). Venue note: MEXC contract klines cap each response at ~2000 bars and
+  **1m history only reaches ~30 days back** (5m/1h reach ≥90/365 days), so a 3-month
+  1m back-fill returns only the most recent ~30 days — a venue retention limit, not a
+  connector bug.
+
+### Added — OKX connector: historical backfill + perpetual funding (reusable, no raw requests)
+- **`OkxCandleFeed::with_range(start_ms, end_ms)`** turns the feed from a single
+  recent `/market/candles` fetch into a paged `/market/history-candles` backfill
+  (newest→oldest, 100/page, exclusive `after` cursor), windowed to `[start, end)`,
+  ascending + de-duplicated, close-stamped exactly like `parse_candles` — the way
+  to pull, e.g., a full day of `1s` bars. A bounded `429` back-off and an
+  inter-page courtesy delay (tunable via `with_page_delay`, `0` in tests) live in
+  the feed; a leading-page error surfaces, a mid-range error keeps the pages
+  already fetched.
+- **`OkxCatalog::fetch(transport, base_url, inst_type)`** and
+  **`fetch_funding_history(transport, base_url, inst_id, limit)` + `funding_period_ms`**:
+  the instruments catalogue and the perpetual funding-rate schedule are now first-
+  class connector entry points over the mockable `Transport` seam — callers never
+  hand-build a URL or touch a response body. All unit-tested with `MockTransport`
+  (paging/windowing/dedup/429-retry/leading-error, catalogue + funding fetch).
+- **Why:** these were previously ad-hoc `reqwest` requests inside the `playground`
+  binary — i.e. data-download logic living in user/strategy code, which is exactly
+  what an exchange-agnostic library exists to prevent (no per-user request points;
+  reusable across consumers). The playground is now a thin consumer of the
+  connector. Backtest output is **bit-identical** to the old path. Funding is
+  applied **by default** for OKX perps in the playground runner (opt out with
+  `--funding false`); the `SimulatedExchange` global default stays off so the
+  parity golden-master remains bit-identical.
+
+### Fixed — sub-basis-point funding now accrues (venue-wide precision fix)
+- **The funding-rate unit is now `1e-8` fractions, not basis points.** The engine's
+  funding charge was basis-point-granular (`amount = notional · rate_bps / 10_000`),
+  so real venue rates — routinely **sub-1bp** for major perps (OKX BTC-USDT-SWAP on
+  2026-05-31 ranged 0.02–0.47 bp) — rounded to `0` and accrued nothing. Funding is a
+  real, recurring cost on perpetuals, so this silently understated it.
+- **The fix:** a single authoritative `akadro_core::FUNDING_RATE_SCALE = 8` (`1e-8`,
+  i.e. exactly Binance's 8-decimal `fundingRate` precision) plus a new
+  `Money::mul_rate` (the `10_000×`-finer analogue of `mul_bps`, divisor derived from
+  the same constant so connector scale and engine charge cannot drift). The schedule
+  path in `SimulatedExchange` now charges via `mul_rate`; **every** funding-producing
+  connector re-exports the core constant and normalizes to it. A `0.0000466`
+  (0.47 bp) rate now charges where it previously charged nothing.
+
+### Added — funding-rate history for every funding-capable venue
+- `fetch_funding_history` + `parse_funding_rate` now exist for **all five** venues
+  with perpetual funding, each over the mockable `Transport` seam (no raw requests),
+  normalizing to `FUNDING_RATE_SCALE`: `akadro-venue-okx`, `akadro-venue-binance`,
+  **`akadro-venue-mexc`** (`/api/v1/contract/funding_rate/history`, public; rate is a
+  JSON number), **`akadro-venue-bybit`** (`/v5/market/funding/history?category=linear`;
+  string rate), and **`akadro-venue-kucoin`** (`/api/v1/contract/funding-rates` on the
+  futures host `FUTURES_BASE_URL`; rate is a JSON number in **scientific notation**).
+  Number-typed rates are rendered to a fixed (non-exponential) decimal before
+  fixed-point parsing, so a tiny sub-bp rate (or KuCoin's `1.49E-4`) is never mangled
+  and no `f64` reaches the money path beyond the one venue-data boundary parse.
+- **Closed loop:** each parser has `MockTransport` fixture tests (sub-bp + sort +
+  error paths), and the live public funding endpoints were hit on 2026-06-01 to
+  **verify the real response schemas** — which corrected KuCoin's fields to
+  `fundingRate`/`timepoint` (a fixture had matched a wrong guess). The DEX (AMM swap)
+  connector has no funding concept; KuCoin's connector is spot-only, so its funding
+  fetch targets the futures host and pairs with a perp `InstrumentSpec` the caller
+  supplies. Live-schema confidence: OKX/Binance/MEXC/Bybit/KuCoin all verified.
+- **`AccountEvent::FundingSettlement.rate` and `Ctx::current_funding_rate` are now at
+  `FUNDING_RATE_SCALE`** (`10_000` = 1 bp), not bps — a strategy-facing unit change,
+  documented on both.
+- **Bit-identical where it matters:** the coarse constant `with_funding(bps, …)` /
+  `FillConfig.funding_bps` API is unchanged and behaviour-identical (bps widens
+  `×10_000` into the `1e-8` unit and `mul_rate`'s `10⁸` divisor cancels it back), so
+  the conservative default and the parity golden-master / replay trade-oracle all
+  stay bit-for-bit identical (verified). Closed loop: a `mul_rate` doctest+unit test,
+  a `sub_basis_point_funding_now_accrues` engine test, updated OKX/Binance parse
+  tests, and an end-to-end OKX BTC-USDT-SWAP backtest that now reports non-zero
+  funding where it reported `~0.00` before.
+
+### Performance — equity marking is O(open positions), not O(catalogue)
+- The engine's per-bar mark-to-market previously scanned **every** instrument in
+  the catalogue each bar to sum equity. On a large venue universe traded by a
+  few-instrument strategy this dominated runtime — e.g. an OKX 1s backtest over a
+  ~1262-pair spot catalogue ran at ~1.1M bars/sec and a ~355-contract swap
+  catalogue at ~3M, while a single-symbol MEXC catalogue hit ~10M (throughput
+  tracked 1/catalogue-size). The `Portfolio` now maintains the set of instruments
+  with a **non-zero** position (updated at the sole position-mutation point), and
+  `mark_to_market` sums over only those — O(open) instead of O(catalogue). Result:
+  the same OKX runs now hit ~9–14M bars/sec (≈5–8×), independent of catalogue
+  size. **Bit-identical** (a flat position marks to 0): the parity golden-master,
+  proptest parity, determinism sweep, and replay trade-oracle all still pass.
+
+### Added — Binance Vision bulk-historical data downloader
+- **`akadro-venue-binance::vision`**: download *years* of klines from
+  `data.binance.vision` flat ZIP/CSV archives (no API key, no `/klines` rate
+  limit). `parse_vision_csv`/`parse_vision_row` normalize the 12-field CSV into
+  `Bar`s **bit-identical** to `parse_klines` (close-time stamped), and
+  `VisionBarSource` is a `DataSource` that plugs straight into `akadro-data`
+  caching (`load_or_cache` / `cache_from_source`) to download once and replay from
+  the Arrow cache. `vision_zip_url` / `vision_checksum_url` / `parse_checksum`
+  build the daily/monthly URLs (note the monthly bar token is `1mo`) and read the
+  GNU `sha256sum` `.CHECKSUM`. **Handles the 2025-01 spot timestamp switch from
+  milliseconds to microseconds** (auto-detected per file via `VisionTimeUnit`) and
+  tolerates an optional CSV header row.
+- **Optional dependency:** `zip` is opt-in behind the new **`vision-zip`** feature
+  (ZIP decode: `unzip_single_csv` / `verify_and_unzip`); the live HTTP downloader
+  `VisionDownloader` (blocking `reqwest`, SHA-256 verify, no tokio) is behind
+  **`vision-net`** (= `net` + `vision-zip`) and lives in `net.rs` (excluded from
+  the coverage gate like the other live IO). The default build pulls in neither.
+  Fixture-tested (ms/µs/header/short-row parsing, URL/checksum builders, an
+  in-memory ZIP round-trip, checksum match/mismatch, cache round-trip + parity
+  with the REST parser); a credential-free `#[ignore]` live test downloads a real
+  month. Built and reviewed against the just-changed crate API (a 4-agent
+  understand sweep + a 4-lens adversarial review, each finding independently
+  verified).
+
 ### Added — OKX, Bybit, and KuCoin venue connectors (REST)
 - **`akadro-venue-okx`** (spot + perpetual **swap**): Base64 HMAC-SHA256 signing
   with the `OK-ACCESS-*` headers + passphrase, `/api/v5/public/instruments` →

@@ -2,13 +2,23 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! A conservative, deterministic simulated exchange.
+//! A deterministic simulated exchange, conservative on **timing** but
+//! **friction-free by default**.
 //!
-//! The default fill model is intentionally conservative so a backtest does not
-//! flatter a strategy (decision D6): market orders fill at the *next* bar's open,
-//! limit orders fill only when a later bar trades through the limit, every fill
-//! pays a flat taker fee, and there is no slippage/latency/partial-fill unless
-//! you opt in via [`FillConfig`].
+//! Timing is conservative so a backtest cannot look ahead (decision D6): a market
+//! order submitted on bar *i* fills at bar *i+1*'s open, and a limit order fills
+//! only once a later bar *reaches* its limit (the bar's low touches/crosses a buy
+//! limit, its high a sell limit).
+//!
+//! Everything else defaults **off**: [`FillConfig::default`] charges **no fee**
+//! (`fee_bps = 0`) and applies no slippage, spread, latency, partial fill,
+//! participation cap, market impact, funding, liquidation, or cash limit. So the
+//! out-of-the-box result is the *most optimistic* configuration — set a realistic
+//! `fee_bps` (the [`SimulatedExchange::new`] constructor requires one) and enable
+//! the realism knobs your strategy needs (slippage to proxy the bid/ask spread, a
+//! participation cap for size, funding for perps, a cash guard, …) via the
+//! `with_*` builders / [`FillConfig`]. The irreducible accuracy ceiling is
+//! bar-resolution data with no bid/ask or order-book depth.
 //!
 //! Supported order kinds (growth pt 4): market, limit, stop, stop-limit,
 //! trailing-stop, market-if-touched, post-only, plus OCO grouping. Optional
@@ -51,8 +61,11 @@ pub struct FillConfig {
     /// Max fraction of a bar's volume (in bps) a single order may take per bar;
     /// `None` means unlimited (fill fully).
     pub max_participation_bps: Option<i64>,
-    /// Funding rate in bps charged on perpetual position notional every
-    /// `funding_interval_bars`; `0` disables funding.
+    /// Constant funding rate **in bps** charged on perpetual position notional every
+    /// `funding_interval_bars`; `0` disables funding. This is the coarse fallback for
+    /// instruments without a [`with_funding_schedule`](SimulatedExchange::with_funding_schedule);
+    /// a real venue schedule carries finer (sub-bp) rates at
+    /// [`FUNDING_RATE_SCALE`](akadro_core::FUNDING_RATE_SCALE).
     pub funding_bps: i64,
     /// Number of bars between funding settlements (`0` disables funding).
     pub funding_interval_bars: u32,
@@ -293,15 +306,21 @@ impl SimulatedExchange {
 
     /// Replay a **time-varying** funding-rate schedule for `instrument` instead of
     /// the constant [`with_funding`](Self::with_funding) rate. `schedule` is a list
-    /// of `(effective_from, signed_bps)` points; at each settlement the rate whose
-    /// `effective_from` is the latest at-or-before the event time is charged and
-    /// reported on the [`AccountEvent::FundingSettlement`]. Settlements still occur
-    /// every `interval_bars` (use the same cadence as the venue, e.g. every 8h of
-    /// bars). The schedule is sorted on insertion; before its first point the rate
-    /// is `0`. Instruments without a schedule fall back to the constant rate, so
-    /// the conservative default path remains bit-identical (parity preserved).
+    /// of `(effective_from, signed_rate)` points where the rate is at
+    /// [`FUNDING_RATE_SCALE`](akadro_core::FUNDING_RATE_SCALE) (`rate · 10⁻⁸`, so
+    /// `10_000` is one basis point) — fine enough to represent the **sub-bp** rates
+    /// real venues quote without rounding them to zero. The venue connectors
+    /// (`okx::fetch_funding_history`, `binance::parse_funding_rate`, …) normalize to
+    /// exactly this scale, so their output drops straight in. At each settlement the
+    /// rate whose `effective_from` is the latest at-or-before the event time is
+    /// charged and reported on the [`AccountEvent::FundingSettlement`]. Settlements
+    /// still occur every `interval_bars` (use the same cadence as the venue, e.g.
+    /// every 8h of bars). The schedule is sorted on insertion; before its first point
+    /// the rate is `0`. Instruments without a schedule fall back to the constant
+    /// (bps) rate, so the conservative default path remains bit-identical (parity
+    /// preserved).
     ///
-    /// Source real funding via a venue feed (e.g. a Mexc/Binance funding history)
+    /// Source real funding via a venue feed (e.g. an OKX/Binance funding history)
     /// cached through the data layer, so the backtest sees the funding regime the
     /// strategy actually targets rather than a flat mean.
     #[must_use]
@@ -722,17 +741,22 @@ impl SimulatedExchange {
         if net == 0 {
             return;
         }
-        // Schedule rate (effective at `now`) if one is set for this instrument,
-        // else the constant `funding_bps` (default path → bit-identical).
+        // The rate is carried at the fine-grained `FUNDING_RATE_SCALE` (1e-8) so a
+        // sub-basis-point venue rate (routine on major perps) is not rounded to zero.
+        // A schedule's rates are already at that scale (the connectors normalize to
+        // it); the coarse constant `funding_bps` fallback is widened up to it
+        // (1 bp = 1e-4 = 10_000 · 1e-8), so both paths charge through the same
+        // `mul_rate` and report one unit. The constant path stays bit-identical: the
+        // 10_000× widen and `mul_rate`'s 10⁸ divisor cancel back to `mul_bps`.
         let rate = match self.funding_schedule.get(&bar.instrument.index()) {
             Some(sched) => funding_rate_at(sched, now),
-            None => self.config.funding_bps,
+            None => self.config.funding_bps.saturating_mul(10_000),
         };
         // Longs pay funding (positive cost), shorts receive (negative). Use the
         // canonical fixed-point path — `Price::notional` widens to i128 before
-        // multiplying and `Money::mul_bps` saturates — rather than a bare i128
+        // multiplying and `Money::mul_rate` saturates — rather than a bare i128
         // multiply that could overflow at an extreme rate (m5).
-        let amount = bar.close.notional(Qty::from_raw(net)).mul_bps(rate);
+        let amount = bar.close.notional(Qty::from_raw(net)).mul_rate(rate);
         if let Some(quote) = quote {
             let cost = Cost::new(quote, amount, CostKind::Funding);
             let mut costs = Costs::new();
@@ -1783,6 +1807,54 @@ mod tests {
     }
 
     #[test]
+    fn market_if_touched_gap_down_buy() {
+        // MIT buy at 90. Bar gaps down to open 85 (below trigger).
+        // The trigger IS touched (bar.low <= 90), so it fires.
+        // Current code fills at trigger (90), not at the worse open (85).
+        let mut x = SimulatedExchange::new(vec![spec()], 0);
+        let mut s = Vec::new();
+        let o = OrderRequest::market_if_touched(
+            I,
+            Side::Buy,
+            Qty::from_raw(1),
+            Price::from_raw(90),
+            TriggerBy::Last,
+        );
+        x.submit(ClientOrderId::new(0), o, Timestamp::from_nanos(1), &mut s);
+        s.clear();
+        // Bar: open=85 (gap down through 90), high=86, low=84
+        x.observe(&bar(85, 86, 84, 85, 1000), Timestamp::from_nanos(2), &mut s);
+        // Fill at trigger (90), not at open (85)
+        assert_eq!(fills(&s)[0].0, Price::from_raw(90));
+    }
+
+    #[test]
+    fn market_if_touched_gap_up_sell() {
+        // MIT sell at 110. Bar gaps up to open 115 (above trigger).
+        // The trigger IS touched (bar.high >= 110), so it fires.
+        // Current code fills at trigger (110), not at the worse open (115).
+        let mut x = SimulatedExchange::new(vec![spec()], 0);
+        let mut s = Vec::new();
+        let o = OrderRequest::market_if_touched(
+            I,
+            Side::Sell,
+            Qty::from_raw(1),
+            Price::from_raw(110),
+            TriggerBy::Last,
+        );
+        x.submit(ClientOrderId::new(0), o, Timestamp::from_nanos(1), &mut s);
+        s.clear();
+        // Bar: open=115 (gap up through 110), high=116, low=114
+        x.observe(
+            &bar(115, 116, 114, 115, 1000),
+            Timestamp::from_nanos(2),
+            &mut s,
+        );
+        // Fill at trigger (110), not at open (115)
+        assert_eq!(fills(&s)[0].0, Price::from_raw(110));
+    }
+
+    #[test]
     fn trailing_stop_follows_then_fires() {
         let mut x = SimulatedExchange::new(vec![spec()], 0);
         let mut s = Vec::new();
@@ -1958,10 +2030,11 @@ mod tests {
         .with_funding_schedule(
             InstrumentId::new(0),
             1, // settle every bar
-            // Passed UNSORTED on purpose — it is sorted on insertion.
+            // Passed UNSORTED on purpose — it is sorted on insertion. Rates are at
+            // FUNDING_RATE_SCALE (1e-8): 100_000 = 10 bp, 500_000 = 50 bp.
             vec![
-                (Timestamp::from_nanos(5), 50),
-                (Timestamp::from_nanos(2), 10),
+                (Timestamp::from_nanos(5), 500_000),
+                (Timestamp::from_nanos(2), 100_000),
             ],
         );
         let mut s = Vec::new();
@@ -1993,18 +2066,67 @@ mod tests {
                 }
             }
         }
-        // ts 3,4 → rate 10 (notional 1000 · 10bps = 1); ts 5,6 → rate 50 (= 5).
+        // ts 3,4 → rate 100_000 (notional 1000 · 10bps = 1); ts 5,6 → 500_000 (= 5).
         // Crucially, the FundingSettlement reports the LOOKED-UP rate, not a
         // config constant.
         assert_eq!(
             seen,
             vec![
-                (10, Money::from_raw(1)),
-                (10, Money::from_raw(1)),
-                (50, Money::from_raw(5)),
-                (50, Money::from_raw(5)),
+                (100_000, Money::from_raw(1)),
+                (100_000, Money::from_raw(1)),
+                (500_000, Money::from_raw(5)),
+                (500_000, Money::from_raw(5)),
             ]
         );
+    }
+
+    /// The headline of the sub-bp funding fix: a real venue rate of `0.0000466`
+    /// (0.47 bp) — which a basis-point-granular model would round to `0 bp` and
+    /// charge nothing — now accrues a non-zero amount. At `FUNDING_RATE_SCALE` that
+    /// rate is `4_669`; on a notional of `1e8` raw it charges `4_669`, whereas the
+    /// old bps path (`mul_bps(0)`) charged `0`.
+    #[test]
+    fn sub_basis_point_funding_now_accrues() {
+        let mut x = SimulatedExchange::with_config(
+            vec![spec_kind(InstrumentKind::PerpetualFuture)],
+            FillConfig {
+                fee_bps: 0,
+                ..FillConfig::default()
+            },
+        )
+        .with_funding_schedule(
+            InstrumentId::new(0),
+            1,
+            vec![(Timestamp::from_nanos(0), 4_669)], // 0.0000466… = 0.47 bp
+        );
+        let mut s = Vec::new();
+        // Long 100 @ 1_000_000 → notional 1e8 raw on the funding bar.
+        x.submit(
+            ClientOrderId::new(0),
+            buy_mkt(100),
+            Timestamp::from_nanos(1),
+            &mut s,
+        );
+        x.observe(
+            &bar(1_000_000, 1_000_000, 1_000_000, 1_000_000, 1_000_000),
+            Timestamp::from_nanos(2),
+            &mut s,
+        );
+        s.clear();
+        x.observe(
+            &bar(1_000_000, 1_000_000, 1_000_000, 1_000_000, 1_000_000),
+            Timestamp::from_nanos(3),
+            &mut s,
+        );
+        let funding: Vec<_> = s
+            .iter()
+            .filter_map(|e| match e {
+                AccountEvent::FundingSettlement { cost, rate, .. } => Some((*rate, cost.amount)),
+                _ => None,
+            })
+            .collect();
+        // 1e8 notional * 4_669 / 1e8 = 4_669 — non-zero, where bp granularity gave 0.
+        assert_eq!(funding, vec![(4_669, Money::from_raw(4_669))]);
     }
 
     #[test]
@@ -3061,5 +3183,163 @@ mod cov_tests {
             })
             .collect();
         assert_eq!(completes, vec![false, false, true]);
+    }
+
+    #[test]
+    fn oco_first_submitted_leg_wins_on_wide_bar() {
+        // Test whether OCO priority is biased by submission order.
+        // Submit TP (limit @110) first, then SL (stop @90). Both are fillable on wide bar (high=112, low=88).
+        // Currently, resting orders are iterated in submission order, so first-submitted-fills.
+        let mut x = SimulatedExchange::new(vec![spot()], 0);
+        let mut s = Vec::new();
+
+        // Establish position: buy 1 at market
+        x.submit(
+            ClientOrderId::new(10),
+            OrderRequest::market(I, Side::Buy, Qty::from_raw(1)),
+            Timestamp::from_nanos(1),
+            &mut s,
+        );
+        s.clear();
+        x.observe(
+            &bar(100, 100, 100, 100, 1000),
+            Timestamp::from_nanos(2),
+            &mut s,
+        );
+        s.clear();
+
+        // Submit bracket: TP first (id 0), SL second (id 1)
+        x.submit(
+            ClientOrderId::new(0),
+            OrderRequest::limit(I, Side::Sell, Qty::from_raw(1), Price::from_raw(110)).oco(7),
+            Timestamp::from_nanos(3),
+            &mut s,
+        );
+        x.submit(
+            ClientOrderId::new(1),
+            OrderRequest::stop(
+                I,
+                Side::Sell,
+                Qty::from_raw(1),
+                Price::from_raw(90),
+                TriggerBy::Last,
+            )
+            .oco(7),
+            Timestamp::from_nanos(3),
+            &mut s,
+        );
+        s.clear();
+
+        // Wide bar: high=112 (triggers TP @110), low=88 (triggers SL @90).
+        // The resting vec will iterate [TP, SL] in order, so TP fills first and claims the group.
+        x.observe(
+            &bar(100, 112, 88, 100, 1000),
+            Timestamp::from_nanos(4),
+            &mut s,
+        );
+
+        let fills: Vec<(ClientOrderId, Price)> = s
+            .iter()
+            .filter_map(|e| match e {
+                AccountEvent::Fill {
+                    client_order_id,
+                    price,
+                    ..
+                } => Some((*client_order_id, *price)),
+                _ => None,
+            })
+            .collect();
+
+        // TP is at 110, SL at 90. Which fills determines direction.
+        assert_eq!(fills.len(), 1, "only one OCO leg fills");
+        let (filled_id, filled_price) = fills[0];
+        assert_eq!(
+            filled_id,
+            ClientOrderId::new(0),
+            "first-submitted TP (id=0) fills, not SL (id=1)"
+        );
+        assert_eq!(
+            filled_price,
+            Price::from_raw(110),
+            "filled at TP price, not SL price"
+        );
+    }
+
+    #[test]
+    fn oco_reverse_submission_order_still_first_wins() {
+        // Now reverse submission: SL (id 0) first, TP (id 1) second.
+        // The resting vec will be [SL, TP], so SL should fill first if order matters.
+        let mut x = SimulatedExchange::new(vec![spot()], 0);
+        let mut s = Vec::new();
+
+        // Establish position
+        x.submit(
+            ClientOrderId::new(10),
+            OrderRequest::market(I, Side::Buy, Qty::from_raw(1)),
+            Timestamp::from_nanos(1),
+            &mut s,
+        );
+        s.clear();
+        x.observe(
+            &bar(100, 100, 100, 100, 1000),
+            Timestamp::from_nanos(2),
+            &mut s,
+        );
+        s.clear();
+
+        // REVERSE ORDER: SL first (id 0), TP second (id 1)
+        x.submit(
+            ClientOrderId::new(0),
+            OrderRequest::stop(
+                I,
+                Side::Sell,
+                Qty::from_raw(1),
+                Price::from_raw(90),
+                TriggerBy::Last,
+            )
+            .oco(7),
+            Timestamp::from_nanos(3),
+            &mut s,
+        );
+        x.submit(
+            ClientOrderId::new(1),
+            OrderRequest::limit(I, Side::Sell, Qty::from_raw(1), Price::from_raw(110)).oco(7),
+            Timestamp::from_nanos(3),
+            &mut s,
+        );
+        s.clear();
+
+        // Wide bar
+        x.observe(
+            &bar(100, 112, 88, 100, 1000),
+            Timestamp::from_nanos(4),
+            &mut s,
+        );
+
+        let fills: Vec<(ClientOrderId, Price)> = s
+            .iter()
+            .filter_map(|e| match e {
+                AccountEvent::Fill {
+                    client_order_id,
+                    price,
+                    ..
+                } => Some((*client_order_id, *price)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(fills.len(), 1, "only one OCO leg fills");
+        let (filled_id, filled_price) = fills[0];
+        // NOW SL (id 0) should fill since it's first in the resting vec
+        assert_eq!(
+            filled_id,
+            ClientOrderId::new(0),
+            "first-submitted SL (id=0) fills, not TP (id=1)"
+        );
+        assert_eq!(
+            filled_price,
+            Price::from_raw(90),
+            "filled at SL price, not TP price"
+        );
     }
 }

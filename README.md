@@ -7,9 +7,11 @@ guarantee against look-ahead, and strict backtest↔live parity.**
 [![rust](https://img.shields.io/badge/rust-1.95%2B-orange)](#)
 
 > Status: **v0.1.1**, intended for use as a dependency in other
-> projects. The look-ahead kill feature, the backtest↔live parity golden-master, a
-> real venue connector (MEXC spot, REST), indicators, analytics, the columnar data
-> cache, and the live/paper shell are all implemented and tested. See
+> projects. The look-ahead kill feature, the backtest↔live parity golden-master,
+> **five REST venue connectors** (MEXC spot+futures, OKX, Binance, Bybit, KuCoin —
+> each with historical back-fill, rate-limit pacing, and paged funding history),
+> indicators, analytics, the columnar data cache, and the live/paper shell are all
+> implemented and tested. See
 > [`INSTALL.md`](INSTALL.md) to add it to a project, and [`AGENTS.md`](AGENTS.md)
 > for the full design and the explicitly-tracked open items.
 
@@ -92,7 +94,11 @@ private registry, generating API docs without source, and why Rust has no
 | `akadro-indicators` | incremental, integer-deterministic indicators (SMA, EMA, MACD, RSI, Bollinger, ATR, …) |
 | `akadro-analytics` | performance/risk metrics (Sharpe, drawdown, trade stats) + walk-forward |
 | `akadro-data` | columnar on-disk cache (Arrow/Feather) + incremental download planning |
-| `akadro-venue-mexc` | MEXC connector — spot + futures, REST signing, WS protocol (the first real venue) |
+| `akadro-venue-mexc` | MEXC connector — spot + futures, REST signing, WS protocol |
+| `akadro-venue-okx` | OKX connector — spot + perpetual swap (REST), Base64-HMAC + passphrase |
+| `akadro-venue-binance` | Binance connector — spot + USDⓈ-M futures (REST) + WS + the Vision bulk-history downloader |
+| `akadro-venue-bybit` | Bybit connector — v5 unified spot + linear perpetual (REST) |
+| `akadro-venue-kucoin` | KuCoin connector — spot (REST), v2 encrypted-passphrase signing |
 | `akadro-venue-dex` | basic AMM/DEX (Uniswap-style) swap connector — validates the venue abstraction |
 | `akadro-live` | live shell: auto-reconnect/resync feeds + paper trading |
 | `akadro` | umbrella crate + prelude (feature-gated re-exports) |

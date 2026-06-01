@@ -21,15 +21,23 @@ smallvec.workspace = true
 # Real network transport (reqwest::blocking) is opt-in; the pure connector logic
 # (signing, parsing, normalization) is always built and fixture-tested.
 reqwest = { workspace = true, optional = true }
+# ZIP decode for the Binance Vision bulk-historical downloader — opt-in.
+zip = { workspace = true, optional = true }
 
 [dev-dependencies]
 akadro-engine.workspace = true
 akadro-backtest.workspace = true
 akadro-data.workspace = true
+# Build in-memory ZIP fixtures for the Vision tests (always available in tests).
+zip = { workspace = true }
 
 [features]
 default = []
 net = ["dep:reqwest"]
+# Decode Binance Vision bulk-historical kline ZIP archives.
+vision-zip = ["dep:zip"]
+# Download + unzip + checksum-verify the bulk archives over HTTP (live IO).
+vision-net = ["net", "vision-zip"]
 
 [lints]
 workspace = true

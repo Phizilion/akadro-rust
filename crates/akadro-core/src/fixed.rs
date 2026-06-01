@@ -52,6 +52,15 @@ pub struct Qty(i64);
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Money(i128);
 
+/// Fixed-point scale (decimal places) for a **funding rate**: a rate of `r` raw
+/// units means the fraction `r · 10⁻⁸`. So `1` basis point (`0.0001`) is `10_000`,
+/// and a sub-basis-point rate like `0.0000466` is `4_669` — representable, where a
+/// basis-point (`10⁻⁴`) scale would round it to `0`. This is exactly Binance's
+/// `fundingRate` precision (8 decimals), captures OKX's sub-bp rates, and is the
+/// unit [`Money::mul_rate`] divides by. Venue connectors normalize funding rates to
+/// this scale; the engine charges them with `mul_rate`, so the two cannot drift.
+pub const FUNDING_RATE_SCALE: u32 = 8;
+
 impl Price {
     /// The zero price.
     pub const ZERO: Price = Price(0);
@@ -239,6 +248,28 @@ impl Money {
     #[must_use]
     pub const fn mul_bps(self, bps: i64) -> Money {
         Money(self.0.saturating_mul(bps as i128) / 10_000)
+    }
+
+    /// Multiply by a funding rate at [`FUNDING_RATE_SCALE`] (`self * rate / 10⁸`),
+    /// truncating toward zero. This is the funding analogue of
+    /// [`mul_bps`](Self::mul_bps) but `10_000×` finer, so **sub-basis-point** funding
+    /// rates — routine on major perps (e.g. `0.0000466` = `0.47 bp`) — accrue a
+    /// non-zero amount instead of rounding away as they do at basis-point scale. The
+    /// divisor is derived from `FUNDING_RATE_SCALE`, so the connector's rate scale and
+    /// the engine's charge can never disagree. Saturates on overflow like `mul_bps`.
+    ///
+    /// ```
+    /// use akadro_core::Money;
+    /// // 1 bp == 10_000 at this scale: the same charge mul_bps(1) would give.
+    /// assert_eq!(Money::from_raw(1_000_000).mul_rate(10_000).raw(), 100);
+    /// assert_eq!(Money::from_raw(1_000_000).mul_bps(1).raw(), 100);
+    /// // A 0.47 bp rate (== 4_669) on a 1e9 notional accrues — mul_bps would see 0 bp.
+    /// assert_eq!(Money::from_raw(1_000_000_000).mul_rate(4_669).raw(), 46_690);
+    /// ```
+    #[inline]
+    #[must_use]
+    pub const fn mul_rate(self, rate: i64) -> Money {
+        Money(self.0.saturating_mul(rate as i128) / 10i128.pow(FUNDING_RATE_SCALE))
     }
 
     /// `true` if strictly positive.
@@ -452,6 +483,28 @@ mod tests {
         assert_eq!(
             Money::from_raw(i128::MIN).mul_bps(2),
             Money::from_raw(i128::MIN / 10_000)
+        );
+    }
+
+    #[test]
+    fn mul_rate_captures_sub_bp_and_agrees_with_mul_bps() {
+        // The divisor is 10^FUNDING_RATE_SCALE — the connector scale and the engine
+        // charge are wired to the same constant.
+        assert_eq!(10i128.pow(FUNDING_RATE_SCALE), 100_000_000);
+        // 1 bp == 10_000 at this scale → identical charge to mul_bps(1).
+        let notional = Money::from_raw(1_000_000);
+        assert_eq!(notional.mul_rate(10_000), notional.mul_bps(1));
+        // THE FIX: a 0.47 bp rate (4_669) accrues, where the old bp-granular path
+        // (mul_bps of the rounded `0` bp) would have charged nothing.
+        let big = Money::from_raw(1_000_000_000);
+        assert_eq!(big.mul_rate(4_669).raw(), 46_690);
+        assert_eq!(big.mul_bps(0).raw(), 0); // what the old path did
+        // Signed: backwardation credits the long (negative cost).
+        assert_eq!(notional.mul_rate(-10_000), Money::from_raw(-100));
+        // Saturates like mul_bps rather than overflow-panicking.
+        assert_eq!(
+            Money::from_raw(i128::MAX).mul_rate(2),
+            Money::from_raw(i128::MAX / 100_000_000)
         );
     }
 

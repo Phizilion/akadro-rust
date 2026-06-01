@@ -267,6 +267,25 @@ never escape that crate.
 - **No foreign types in public signatures (D13).** Wrap them (e.g. `CapSet` over
   a `u64` bitset instead of exposing `enumset`; the engine implements `EventSink`
   rather than handing out a `Vec`).
+- **Library owns the data — no leakage points (D18).** All market/venue data enters
+  through *library-owned, well-defined functions*: the `Transport`-seam connectors
+  (`*Catalog::fetch`, `*Feed::with_range`, `fetch_funding_history`/`…_paged`, …) and
+  the `akadro-data` cache layer (`load_or_cache`). **User/strategy/example code must
+  never hand-roll an HTTP request or hand-inject downloaded data into library
+  structures** — every fetch+parse lives in the connector as reusable code, tested
+  over `MockTransport`. A user *can* technically supply a custom `DataSource`, but
+  that is an unsupported escape hatch we neither document nor encourage; the blessed
+  path is always the library fetcher + cache. This is leakage-prevention discipline,
+  of a piece with the look-ahead (§4) and parity (§5) goals: the fewer places raw
+  data enters, the fewer places a look-ahead/parity bug can. The `playground` is the
+  reference *consumer* — a thin orchestrator, zero raw requests.
+- **Engineering principles.** Code is held to **DRY** (one source of truth — e.g.
+  `FUNDING_RATE_SCALE` lives once in `akadro-core` and connectors re-export it),
+  **SOLID** (the venue trait set is the open/closed extension surface; model traits
+  are sealed, D16), **SoC** (core vocabulary ≠ engine loop ≠ venue I/O ≠ data layer),
+  **LoD** (talk to immediate collaborators via the trait seams, not reach through
+  them), and **fail-fast** (validate at construction, return `Result`/`Option` early,
+  `debug_assert` invariants — never silently coerce bad input).
 - **Future-proofing.** Public enums/structs that may grow are `#[non_exhaustive]`;
   errors are `thiserror` enums, foreign errors wrapped (never `#[from]`-leaked).
 - **Errors over panics in library paths.** `ago` returns `Option`; engine
@@ -336,6 +355,16 @@ to `akadro-live`), `serde` (run-manifest), proc-macro crates (a future
 Every claim is backed by an automated check whose output we observe; where a
 loop can't be closed we say so (§12).
 
+**Production-ready gate — every change runs the closed loop before it is called
+done** (no exceptions, no "should pass"): `cargo test --workspace` green ·
+`cargo clippy --workspace --all-targets` **0 warnings** · `cargo fmt --all --check`
+clean · `cargo doc -D warnings` (with features) clean · **maximize coverage** —
+write a real asserting test for every branch you can exercise (don't game the
+metric) · and **run the replay trade-oracle + parity golden-master on any
+trade-sim/engine change** to prove behaviour is bit-identical (§5). A guessed
+external schema is verified against the live API, not just a fixture. State results
+honestly: if a step was skipped or a loop can't close, say so.
+
 - **Unit tests** in every module, happy and unhappy paths.
 - **Property tests** (proptest): fixed-point round-trip / `notional` / `mul_bps`
   / `diff`; portfolio position conservation and flat-round-trip PnL neutrality;
@@ -379,12 +408,16 @@ itemized so the open loop is explicit (closed-loop principle):
 | `venue-mexc/parse.rs` arg-line attribution artifacts | The `price_scale,` *argument* lines inside `decimal_to_raw(...)` whose decode path *is* exercised; llvm maps them to a region that doesn't independently register. |
 | `testkit/lib.rs` 41 | **Non-deterministic** thread race (`break` on consumer-dropped); covering it would need a `sleep`-based race that contradicts the suite's determinism. |
 | test-only `_ => None` arms in `filter_map` helpers (`exchange.rs`, `venue-dex`, `client.rs`) | Test scaffolding, not library behaviour. |
+| venue back-fill **pacing/back-off** lines (`venue-*` `with_page_delay` feeds + funding paging): the `else { Duration::from_secs(2) }` back-off branch and the two `std::thread::sleep(…)` calls | Only execute when `page_delay > 0` (a real download). Deterministic tests set `page_delay = ZERO` (no sleep, instant 429 retry), so the *pacing-on* arm is unreachable without a real wall-clock sleep — same class as the `testkit` sleep race above. The paging **logic** (cursor/guard/dedup/window-clip/429-retry/exhaustion/error) is all tested at delay 0. |
 
-To reproduce: `cargo llvm-cov ... --show-missing-lines` (command above).
+To reproduce: `cargo llvm-cov ... --show-missing-lines` (command above). Note the
+playground is excluded from the gate (`--exclude playground`, scratch binary, §8); the
+WS/exec/connector order paths are the main residual below a literal 99% line and are
+tracked as live-IO/growth work, not regressions.
 
 ---
 
-## 11. Hardened decisions D1–D17 (index)
+## 11. Hardened decisions D1–D18 (index)
 
 | #   | Decision |
 |-----|----------|
@@ -405,6 +438,7 @@ To reproduce: `cargo llvm-cov ... --show-missing-lines` (command above).
 | D15 | k-way merge should be a loser-tree (the real >10% hotspot); benches gate it. §13 |
 | D16 | Sealed vs open trait table: venue traits are the extension surface; model traits will be sealed. |
 | D17 | Reserve fee-tier/margin/liquidation/trigger-price seams now (additive later). |
+| D18 | Library owns the data — every fetch+parse is reusable connector code over the `Transport` seam + the `akadro-data` cache; user code never hand-rolls requests or injects raw data (leakage-prevention). §7 |
 
 ---
 
@@ -581,7 +615,14 @@ or blocked on a future subsystem):**
 
 See `CHANGELOG.md` (keep-a-changelog). Current: `0.1.1` (2026-06-01) — the v0.2
 growth work (indicators, analytics, data layer, live shell, five venue connectors,
-expanded order/fill realism) plus the final pre-release bug-hunt fix pass. `0.1.0`
-(2026-05-31) was the MVP that proved the architecture (kill feature, parity,
-exchange-agnostic core, deterministic engine + simulated exchange, sample
-strategy, full test suite).
+expanded order/fill realism) and the pre-release bug-hunt fix pass, plus the final
+pre-release hardening: the **Binance Vision** bulk-historical downloader; a
+venue-wide **sub-basis-point funding** precision fix (`FUNDING_RATE_SCALE = 1e-8` +
+`Money::mul_rate`, bit-identical on the conservative default); **O(open positions)**
+equity marking; and **full venue feature parity** — historical `with_range`
+back-fill, `with_page_delay` pacing + 429 back-off, `*Catalog::fetch`, and paged
+`fetch_funding_history` on every connector (OKX/Binance/MEXC/Bybit/KuCoin), each
+verified against the live venue schema and hardened by a 41-agent adversarial review
+(D18 library-owns-data, DRY/SOLID/SoC/LoD/fail-fast). `0.1.0` (2026-05-31) was the
+MVP that proved the architecture (kill feature, parity, exchange-agnostic core,
+deterministic engine + simulated exchange, sample strategy, full test suite).

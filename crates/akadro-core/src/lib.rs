@@ -40,7 +40,7 @@ pub use event::{
     AccountEvent, Bar, CancelReason, CancelRejectReason, Cost, CostKind, Costs, Event,
     RejectReason, signal_channel,
 };
-pub use fixed::{Money, Price, Qty};
+pub use fixed::{FUNDING_RATE_SCALE, Money, Price, Qty};
 pub use ids::{AssetId, ClientOrderId, InstrumentId, Timestamp, VenueId};
 pub use instrument::{CapSet, Capability, InstrumentKind, InstrumentSpec, RoundingRule};
 pub use order::{

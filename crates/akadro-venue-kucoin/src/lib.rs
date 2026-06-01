@@ -273,6 +273,29 @@ pub struct KucoinCatalog {
 }
 
 impl KucoinCatalog {
+    /// Fetch `/api/v1/symbols` over `transport` and parse it into a catalogue (see
+    /// [`from_symbols`](Self::from_symbols)). The reusable connector entry point —
+    /// callers never build the URL or touch the response body.
+    ///
+    /// # Errors
+    /// [`KucoinError::Transport`] on a transport failure or a non-2xx status;
+    /// [`KucoinError::Parse`] on malformed JSON.
+    pub fn fetch<T: Transport>(transport: &mut T, base_url: &str) -> Result<Self, KucoinError> {
+        let resp = transport.send(&HttpRequest {
+            method: Method::Get,
+            url: format!("{base_url}/api/v1/symbols"),
+            body: None,
+            headers: Vec::new(),
+        })?;
+        if !resp.is_success() {
+            return Err(KucoinError::Transport(format!(
+                "symbols HTTP {}",
+                resp.status
+            )));
+        }
+        Self::from_symbols(&resp.body)
+    }
+
     /// Parse `/api/v1/symbols` into a catalogue. Only `enableTrading` symbols are
     /// kept; the tick is `priceIncrement`, the lot is `baseIncrement`, and the
     /// minimum notional is `quoteMinSize`. Each gets a dense [`InstrumentId`].
@@ -412,8 +435,162 @@ pub fn parse_candles(
     Ok(bars)
 }
 
-/// A [`DataSource`] streaming KuCoin candles for one instrument (one fetch; KuCoin
-/// returns up to 1500 candles per call).
+// --- funding-rate history (KuCoin Futures) -----------------------------------
+
+/// KuCoin **Futures** REST host — funding lives here, distinct from the spot host
+/// this connector otherwise targets.
+pub const FUTURES_BASE_URL: &str = "https://api-futures.kucoin.com";
+
+/// Funding-rate fixed-point scale — re-exported from `akadro-core` so the connector
+/// and the engine's `mul_rate` charge cannot drift. Rates normalize to `1e-8`
+/// fractions: KuCoin's `0.0001` (1 bp) → `10_000`, and a sub-bp `0.0000466` →
+/// `4_660` instead of rounding to `0`. See `SimulatedExchange::with_funding_schedule`.
+pub use akadro_core::FUNDING_RATE_SCALE;
+
+#[derive(Deserialize)]
+struct FundingResp {
+    #[serde(default)]
+    data: Vec<FundingRow>,
+}
+#[derive(Deserialize)]
+struct FundingRow {
+    // Verified live (2026-06-01): the field is `timepoint` (lowercase p) and the
+    // rate is `fundingRate`, returned as a JSON number in scientific notation
+    // (e.g. `1.49E-4`) — handled by `funding_rate_to_raw` via a fixed-decimal render.
+    timepoint: i64, // settlement epoch-ms
+    #[serde(rename = "fundingRate")]
+    funding_rate: serde_json::Value,
+}
+
+/// Convert a JSON funding rate (KuCoin's `value` is a number; a string is accepted
+/// too) to a raw fixed-point value at [`FUNDING_RATE_SCALE`]. A JSON number is
+/// rendered to a fixed (non-exponential) decimal first, so a tiny sub-bp rate is not
+/// emitted as `1e-7` and no `f64` reaches the money path beyond this one venue-data
+/// boundary parse.
+fn funding_rate_to_raw(v: &serde_json::Value) -> Result<i64, KucoinError> {
+    match v {
+        serde_json::Value::String(s) => decimal_to_raw(s, FUNDING_RATE_SCALE),
+        serde_json::Value::Number(n) => {
+            let f = n
+                .as_f64()
+                .ok_or_else(|| KucoinError::Parse("funding rate not numeric".into()))?;
+            decimal_to_raw(&format!("{f:.18}"), FUNDING_RATE_SCALE)
+        }
+        other => Err(KucoinError::Parse(format!("bad funding value {other}"))),
+    }
+}
+
+/// Parse a KuCoin Futures `GET /api/v1/contract/funding-rates` body into an
+/// ascending `(timestamp, rate)` schedule for `SimulatedExchange::with_funding_schedule`.
+/// Each row is `{timePoint (ms), value}`; the `value` is normalized to
+/// [`FUNDING_RATE_SCALE`] (`1e-8`), so KuCoin's sub-bp rates are preserved rather
+/// than rounded to `0`. The result is re-sorted ascending.
+///
+/// # Errors
+/// [`KucoinError::Parse`] on bad JSON, a bad rate, or a timestamp overflow.
+pub fn parse_funding_rate(json: &str) -> Result<Vec<(Timestamp, i64)>, KucoinError> {
+    let resp: FundingResp =
+        serde_json::from_str(json).map_err(|e| KucoinError::Parse(e.to_string()))?;
+    let mut out: Vec<(Timestamp, i64)> = resp
+        .data
+        .iter()
+        .map(|r| {
+            let ns = r
+                .timepoint
+                .checked_mul(1_000_000)
+                .ok_or_else(|| KucoinError::Parse("timepoint overflow".into()))?;
+            Ok((
+                Timestamp::from_nanos(ns),
+                funding_rate_to_raw(&r.funding_rate)?,
+            ))
+        })
+        .collect::<Result<_, KucoinError>>()?;
+    out.sort_by_key(|(t, _)| t.as_nanos());
+    Ok(out)
+}
+
+/// Fetch `/api/v1/contract/funding-rates` for the futures `symbol` (e.g.
+/// `"XBTUSDTM"`) over the time range `[from_ms, to_ms]` and parse it into a
+/// `with_funding_schedule` schedule (rates at [`FUNDING_RATE_SCALE`]). Pass
+/// [`FUTURES_BASE_URL`] as `base_url` — funding is a **futures** endpoint, and this
+/// spot connector has no perpetual catalogue, so pair the returned schedule with a
+/// `PerpetualFuture` `InstrumentSpec` you supply. A public endpoint — no signing.
+///
+/// # Errors
+/// [`KucoinError::Transport`] on a transport failure or a non-2xx status;
+/// [`KucoinError::Parse`] on malformed JSON.
+pub fn fetch_funding_history<T: Transport>(
+    transport: &mut T,
+    base_url: &str,
+    symbol: &str,
+    from_ms: i64,
+    to_ms: i64,
+) -> Result<Vec<(Timestamp, i64)>, KucoinError> {
+    let resp = transport.send(&HttpRequest {
+        method: Method::Get,
+        url: format!(
+            "{base_url}/api/v1/contract/funding-rates?symbol={symbol}&from={from_ms}&to={to_ms}"
+        ),
+        body: None,
+        headers: Vec::new(),
+    })?;
+    if !resp.is_success() {
+        return Err(KucoinError::Transport(format!(
+            "contract/funding-rates HTTP {}",
+            resp.status
+        )));
+    }
+    parse_funding_rate(&resp.body)
+}
+
+/// Page `/api/v1/contract/funding-rates` back over `[from_ms, to_ms]` into one
+/// ascending [`FUNDING_RATE_SCALE`] schedule. KuCoin caps each call at ~100
+/// settlements (~33 days at the 8h cadence) anchored on `to`, so a long window needs
+/// several pages: each moves `to` to just before the oldest settlement seen, up to
+/// `max_pages`. Stops early on an empty page; de-duplicates by time. The reusable
+/// connector entry point — pass [`FUTURES_BASE_URL`].
+///
+/// # Errors
+/// [`KucoinError::Transport`] on a transport failure or a non-2xx status;
+/// [`KucoinError::Parse`] on malformed JSON.
+pub fn fetch_funding_history_paged<T: Transport>(
+    transport: &mut T,
+    base_url: &str,
+    symbol: &str,
+    from_ms: i64,
+    to_ms: i64,
+    max_pages: u32,
+) -> Result<Vec<(Timestamp, i64)>, KucoinError> {
+    let mut all: Vec<(Timestamp, i64)> = Vec::new();
+    let mut cursor_to = to_ms;
+    for _ in 0..max_pages.max(1) {
+        let page = fetch_funding_history(transport, base_url, symbol, from_ms, cursor_to)?; // ascending
+        let Some((oldest, _)) = page.first().copied() else {
+            break;
+        };
+        let oldest_ms = oldest.as_nanos() / 1_000_000;
+        all.extend(page);
+        if oldest_ms <= from_ms {
+            break;
+        }
+        let next_to = oldest_ms - 1;
+        if next_to >= cursor_to {
+            break; // no backward progress
+        }
+        cursor_to = next_to;
+    }
+    all.sort_by_key(|(t, _)| t.as_nanos());
+    all.dedup_by_key(|(t, _)| t.as_nanos());
+    all.retain(|(t, _)| {
+        let ms = t.as_nanos() / 1_000_000;
+        ms >= from_ms && ms <= to_ms
+    });
+    Ok(all)
+}
+
+/// A [`DataSource`] streaming KuCoin candles for one instrument (a single recent
+/// fetch — KuCoin returns up to 1500 candles — or, with
+/// [`with_range`](KucoinCandleFeed::with_range), a paged historical window).
 pub struct KucoinCandleFeed<T> {
     transport: T,
     base_url: String,
@@ -422,6 +599,13 @@ pub struct KucoinCandleFeed<T> {
     candle_type: String,
     price_scale: u32,
     qty_scale: u32,
+    /// `Some((start_ms, end_ms))` → page back over `[start, end)`; `None` → one
+    /// recent fetch (KuCoin returns up to 1500 candles).
+    range: Option<(i64, i64)>,
+    /// Inter-page courtesy delay + 429 back-off unit; `0` in tests.
+    page_delay: std::time::Duration,
+    /// Bounded retries on a `429` page.
+    max_retries: u32,
     buffer: std::collections::VecDeque<Bar>,
     fetched: bool,
 }
@@ -447,35 +631,140 @@ impl<T: Transport> KucoinCandleFeed<T> {
             candle_type: candle_type.into(),
             price_scale,
             qty_scale,
+            range: None,
+            page_delay: std::time::Duration::from_millis(120),
+            max_retries: 8,
             buffer: std::collections::VecDeque::new(),
             fetched: false,
         }
     }
 
-    fn fetch(&mut self) -> Result<(), KucoinError> {
-        let url = format!(
+    /// Back-fill an arbitrary historical window `[start_ms, end_ms)` (epoch-ms on the
+    /// candle **open** time) by paging `/api/v1/market/candles` newest→oldest (KuCoin
+    /// returns ≤1500 candles per call, newest-first, bounded by `startAt`/`endAt` in
+    /// **seconds**), instead of the single recent fetch. Bars come back ascending,
+    /// de-duplicated, close-stamped exactly like [`parse_candles`].
+    #[must_use]
+    pub fn with_range(mut self, start_ms: i64, end_ms: i64) -> Self {
+        self.range = Some((start_ms, end_ms));
+        self
+    }
+
+    /// Override the inter-page courtesy delay (default 120 ms; also the 429 back-off
+    /// unit). Set to [`Duration::ZERO`](std::time::Duration::ZERO) in tests.
+    #[must_use]
+    pub fn with_page_delay(mut self, delay: std::time::Duration) -> Self {
+        self.page_delay = delay;
+        self
+    }
+
+    /// One `/api/v1/market/candles` page bounded by optional `[startAt, endAt]`
+    /// (**seconds**), with a bounded 429 back-off (zero at `page_delay` 0).
+    fn fetch_page(
+        &mut self,
+        start_s: Option<i64>,
+        end_s: Option<i64>,
+    ) -> Result<Vec<Bar>, KucoinError> {
+        use core::fmt::Write as _;
+        let mut url = format!(
             "{}/api/v1/market/candles?type={}&symbol={}",
             self.base_url, self.candle_type, self.symbol
         );
-        let resp = self.transport.send(&HttpRequest {
-            method: Method::Get,
-            url,
-            body: None,
-            headers: Vec::new(),
-        })?;
-        if !resp.is_success() {
-            return Err(KucoinError::Transport(format!(
-                "candles HTTP {}",
-                resp.status
+        if let Some(s) = start_s {
+            let _ = write!(url, "&startAt={s}");
+        }
+        if let Some(e) = end_s {
+            let _ = write!(url, "&endAt={e}");
+        }
+        let backoff = if self.page_delay.is_zero() {
+            std::time::Duration::ZERO
+        } else {
+            std::time::Duration::from_secs(2)
+        };
+        let mut retries = 0u32;
+        loop {
+            let resp = self.transport.send(&HttpRequest {
+                method: Method::Get,
+                url: url.clone(),
+                body: None,
+                headers: Vec::new(),
+            })?;
+            if resp.status == 429 && retries < self.max_retries {
+                retries += 1;
+                if !backoff.is_zero() {
+                    std::thread::sleep(backoff);
+                }
+                continue;
+            }
+            if !resp.is_success() {
+                return Err(KucoinError::Transport(format!(
+                    "candles HTTP {}",
+                    resp.status
+                )));
+            }
+            return parse_candles(
+                &resp.body,
+                self.instrument,
+                self.price_scale,
+                self.qty_scale,
+                &self.candle_type,
+            );
+        }
+    }
+
+    /// Page `[start_ms, end_ms)` newest→oldest by moving the `endAt` cursor (seconds)
+    /// back to just before the oldest bar received, until a page reaches `start`.
+    fn backfill(&mut self, start_ms: i64, end_ms: i64) -> Result<Vec<Bar>, KucoinError> {
+        let interval_secs = candle_seconds(&self.candle_type);
+        if interval_secs == 0 {
+            return Err(KucoinError::Parse(format!(
+                "unsupported candle type {:?}",
+                self.candle_type
             )));
         }
-        let bars = parse_candles(
-            &resp.body,
-            self.instrument,
-            self.price_scale,
-            self.qty_scale,
-            &self.candle_type,
-        )?;
+        let start_secs = start_ms / 1000;
+        let mut cursor_end_secs = end_ms / 1000;
+        let mut all: Vec<Bar> = Vec::new();
+        loop {
+            let page = self.fetch_page(Some(start_secs), Some(cursor_end_secs))?;
+            if page.is_empty() {
+                break;
+            }
+            // `ts` is close time (ns); open = close - interval. Oldest open (secs)
+            // drives the next (earlier) `endAt` cursor.
+            let oldest_open_secs = page
+                .iter()
+                .map(|b| b.ts.as_nanos() / 1_000_000_000 - interval_secs)
+                .min()
+                .expect("non-empty");
+            all.extend(page);
+            if oldest_open_secs <= start_secs {
+                break;
+            }
+            let next_end = oldest_open_secs - 1; // strictly older than the oldest we have
+            if next_end >= cursor_end_secs {
+                break; // no backward progress
+            }
+            cursor_end_secs = next_end;
+            if !self.page_delay.is_zero() {
+                std::thread::sleep(self.page_delay);
+            }
+        }
+        all.sort_by_key(|b| b.ts.as_nanos());
+        all.dedup_by_key(|b| b.ts.as_nanos());
+        let interval_ms = interval_secs * 1000;
+        all.retain(|b| {
+            let open_ms = b.ts.as_nanos() / 1_000_000 - interval_ms;
+            open_ms >= start_ms && open_ms < end_ms
+        });
+        Ok(all)
+    }
+
+    fn fetch(&mut self) -> Result<(), KucoinError> {
+        let bars = match self.range {
+            Some((s, e)) => self.backfill(s, e)?,
+            None => self.fetch_page(None, None)?,
+        };
         self.buffer.extend(bars);
         Ok(())
     }
@@ -800,6 +1089,282 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn funding_rate_parses_numbers_to_fine_scale_sorted() {
+        // EXACT live shape (verified 2026-06-01): `fundingRate` is a JSON number in
+        // SCIENTIFIC notation, the timestamp field is `timepoint` (lowercase p).
+        let json = r#"{"code":"200000","data":[
+            {"symbol":"XBTUSDTM","fundingRate":1.49E-4,"timepoint":1700028800000},
+            {"symbol":"XBTUSDTM","fundingRate":-1.6E-5,"timepoint":1700000000000}
+        ]}"#;
+        let sched = parse_funding_rate(json).unwrap();
+        assert_eq!(sched.len(), 2);
+        // Sorted ascending; at FUNDING_RATE_SCALE (1e-8): 1.49E-4 (= 0.000149 = 1.49 bp)
+        // → 14_900; the sub-bp -1.6E-5 (-0.16 bp) → -1_600 (preserved, exponent handled).
+        assert_eq!(
+            sched[0],
+            (Timestamp::from_nanos(1_700_000_000_000_000_000), -1_600)
+        );
+        assert_eq!(
+            sched[1],
+            (Timestamp::from_nanos(1_700_028_800_000_000_000), 14_900)
+        );
+        // A string rate is accepted too; bad JSON errors.
+        let str_val = r#"{"data":[{"timepoint":1700000000000,"fundingRate":"0.0001"}]}"#;
+        assert_eq!(parse_funding_rate(str_val).unwrap()[0].1, 10_000);
+        assert!(parse_funding_rate("nope").is_err());
+    }
+
+    #[test]
+    fn fetch_funding_history_builds_futures_url() {
+        let mut t = MockTransport::new(vec![HttpResponse {
+            status: 200,
+            body: r#"{"code":"200000","data":[{"symbol":"XBTUSDTM","fundingRate":1.49E-4,"timepoint":1700000000000}]}"#.into(),
+        }]);
+        let sched = fetch_funding_history(
+            &mut t,
+            FUTURES_BASE_URL,
+            "XBTUSDTM",
+            1_700_000_000_000,
+            1_700_100_000_000,
+        )
+        .unwrap();
+        assert_eq!(sched.len(), 1);
+        assert!(
+            t.sent[0]
+                .url
+                .contains("/api/v1/contract/funding-rates?symbol=XBTUSDTM&from=1700000000000")
+        );
+        assert!(t.sent[0].headers.is_empty()); // public endpoint — unsigned
+        let mut bad = MockTransport::new(vec![HttpResponse {
+            status: 500,
+            body: String::new(),
+        }]);
+        assert!(fetch_funding_history(&mut bad, FUTURES_BASE_URL, "XBTUSDTM", 0, 1).is_err());
+    }
+
+    #[test]
+    fn catalog_fetch_via_transport() {
+        let mut t = MockTransport::new(vec![HttpResponse {
+            status: 200,
+            body: SYMBOLS.into(),
+        }]);
+        let cat = KucoinCatalog::fetch(&mut t, "http://x").unwrap();
+        assert!(cat.id_of("BTC-USDT").is_some());
+        assert!(t.sent[0].url.ends_with("/api/v1/symbols"));
+        let mut bad = MockTransport::new(vec![HttpResponse {
+            status: 503,
+            body: String::new(),
+        }]);
+        assert!(KucoinCatalog::fetch(&mut bad, "http://x").is_err());
+    }
+
+    /// A `/api/v1/market/candles` page (KuCoin order [time, o, c, h, l, vol, turn],
+    /// flat 100) for the given **open** seconds.
+    fn kc_candle_page(opens_s: &[i64]) -> String {
+        let rows = opens_s
+            .iter()
+            .map(|t| format!(r#"["{t}","100","100","100","100","1","1"]"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(r#"{{"code":"200000","data":[{rows}]}}"#)
+    }
+
+    #[test]
+    fn range_feed_pages_backward_by_end() {
+        // Two 5-bar 1min pages spanning opens [0..540]s within [0,600)s; newest→oldest.
+        let recent = kc_candle_page(&[
+            1_700_000_300,
+            1_700_000_360,
+            1_700_000_420,
+            1_700_000_480,
+            1_700_000_540,
+        ]);
+        let older = kc_candle_page(&[
+            1_700_000_000,
+            1_700_000_060,
+            1_700_000_120,
+            1_700_000_180,
+            1_700_000_240,
+        ]);
+        let mut feed = KucoinCandleFeed::new(
+            MockTransport::new(vec![
+                HttpResponse {
+                    status: 200,
+                    body: recent,
+                },
+                HttpResponse {
+                    status: 200,
+                    body: older,
+                },
+            ]),
+            "http://x",
+            "BTC-USDT",
+            InstrumentId::new(0),
+            "1min",
+            1,
+            0,
+        )
+        .with_range(1_700_000_000_000, 1_700_000_600_000)
+        .with_page_delay(std::time::Duration::ZERO);
+        let mut n = 0;
+        while feed.next_event().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 10);
+    }
+
+    fn kc_range_feed(
+        bodies: Vec<HttpResponse>,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> KucoinCandleFeed<MockTransport> {
+        KucoinCandleFeed::new(
+            MockTransport::new(bodies),
+            "http://x",
+            "BTC-USDT",
+            InstrumentId::new(0),
+            "1min",
+            1,
+            0,
+        )
+        .with_range(start_ms, end_ms)
+        .with_page_delay(std::time::Duration::ZERO)
+    }
+
+    fn kc_ok(body: String) -> HttpResponse {
+        HttpResponse { status: 200, body }
+    }
+
+    #[test]
+    fn range_feed_guards_against_no_progress() {
+        let p = || kc_ok(kc_candle_page(&[1_700_000_300, 1_700_000_360]));
+        let mut feed = kc_range_feed(vec![p(), p()], 1_700_000_000_000, 1_700_000_600_000);
+        let mut n = 0;
+        while feed.next_event().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 2); // de-duplicated; guard stopped the stall
+    }
+
+    #[test]
+    fn range_feed_clips_window_and_dedups() {
+        // open seconds; start = 1_700_000_060 s. The 1_700_000_000 bar is < start
+        // (clipped); the 1_700_000_060 duplicate collapses.
+        let page = kc_candle_page(&[1_700_000_000, 1_700_000_060, 1_700_000_060, 1_700_000_120]);
+        let mut feed = kc_range_feed(vec![kc_ok(page)], 1_700_000_060_000, 1_700_000_600_000);
+        let mut n = 0;
+        while feed.next_event().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 2); // 60 & 120; 0 clipped, dup collapsed
+    }
+
+    #[test]
+    fn range_feed_429_exhausted_yields_none() {
+        let mut feed = kc_range_feed(
+            (0..10)
+                .map(|_| HttpResponse {
+                    status: 429,
+                    body: String::new(),
+                })
+                .collect(),
+            1_700_000_000_000,
+            1_700_000_060_000,
+        );
+        assert!(feed.next_event().is_none());
+    }
+
+    #[test]
+    fn range_feed_retries_on_429() {
+        let mut feed = KucoinCandleFeed::new(
+            MockTransport::new(vec![
+                HttpResponse {
+                    status: 429,
+                    body: String::new(),
+                },
+                HttpResponse {
+                    status: 200,
+                    body: kc_candle_page(&[1_700_000_000]),
+                },
+            ]),
+            "http://x",
+            "BTC-USDT",
+            InstrumentId::new(0),
+            "1min",
+            1,
+            0,
+        )
+        .with_range(1_700_000_000_000, 1_700_000_060_000)
+        .with_page_delay(std::time::Duration::ZERO);
+        assert!(feed.next_event().is_some()); // survived the 429
+    }
+
+    #[test]
+    fn funding_history_paged_walks_back() {
+        let p1 = r#"{"code":"200000","data":[
+            {"symbol":"XBTUSDTM","fundingRate":1.0E-4,"timepoint":1700000120000},
+            {"symbol":"XBTUSDTM","fundingRate":2.0E-4,"timepoint":1700000060000}]}"#;
+        let p2 = r#"{"code":"200000","data":[
+            {"symbol":"XBTUSDTM","fundingRate":-1.0E-4,"timepoint":1700000000000}]}"#;
+        let mut t = MockTransport::new(vec![
+            HttpResponse {
+                status: 200,
+                body: p1.into(),
+            },
+            HttpResponse {
+                status: 200,
+                body: p2.into(),
+            },
+        ]);
+        let sched = fetch_funding_history_paged(
+            &mut t,
+            FUTURES_BASE_URL,
+            "XBTUSDTM",
+            1_700_000_000_000,
+            1_700_000_120_000,
+            10,
+        )
+        .unwrap();
+        assert_eq!(sched.len(), 3);
+        assert!(t.sent[0].url.contains("to=1700000120000"));
+        assert!(t.sent[1].url.contains("to=1700000059999")); // oldest(60000)-1
+    }
+
+    #[test]
+    fn funding_history_paged_guards_no_progress() {
+        // Same page twice (oldest above `from`): the `to` cursor stalls → stop.
+        let page = r#"{"code":"200000","data":[
+            {"symbol":"XBTUSDTM","fundingRate":1.0E-4,"timepoint":1700000120000},
+            {"symbol":"XBTUSDTM","fundingRate":2.0E-4,"timepoint":1700000060000}]}"#;
+        let mut t = MockTransport::new(vec![
+            HttpResponse {
+                status: 200,
+                body: page.into(),
+            },
+            HttpResponse {
+                status: 200,
+                body: page.into(),
+            },
+        ]);
+        let sched = fetch_funding_history_paged(
+            &mut t,
+            FUTURES_BASE_URL,
+            "XBTUSDTM",
+            0,
+            1_700_000_120_000,
+            10,
+        )
+        .unwrap();
+        assert_eq!(sched.len(), 2); // de-duplicated; guard stopped the stall
+        assert_eq!(t.sent.len(), 2);
+        let mut bad = MockTransport::new(vec![HttpResponse {
+            status: 500,
+            body: String::new(),
+        }]);
+        assert!(fetch_funding_history_paged(&mut bad, FUTURES_BASE_URL, "X", 0, 1, 10).is_err());
     }
 
     #[test]

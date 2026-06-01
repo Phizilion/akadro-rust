@@ -11,8 +11,9 @@ publish = false
 # The umbrella (backtest is on by default) plus analytics, the data cache, and
 # serde (to save the run report to a file).
 akadro = { path = "../akadro", features = ["analytics", "data", "serde"] }
-# The MEXC connector with its real reqwest transport.
+# The MEXC + OKX connectors with their real reqwest transports.
 akadro-venue-mexc = { path = "../akadro-venue-mexc", features = ["net"] }
+akadro-venue-okx = { path = "../akadro-venue-okx", features = ["net"] }
 
 [lints]
 workspace = true

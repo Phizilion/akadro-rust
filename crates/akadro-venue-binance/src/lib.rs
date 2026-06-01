@@ -29,11 +29,20 @@ use akadro_core::{
 use serde::Deserialize;
 
 pub mod futures;
+pub mod vision;
 pub mod ws;
 pub use futures::{
-    BinanceSignalFeed, FUTURES_BASE_URL, parse_funding_rate, parse_long_short_ratio,
-    parse_open_interest,
+    BinanceSignalFeed, FUTURES_BASE_URL, fetch_funding_history, fetch_funding_history_paged,
+    parse_funding_rate, parse_long_short_ratio, parse_open_interest,
 };
+#[cfg(all(feature = "net", feature = "vision-zip"))]
+pub use net::VisionDownloader;
+pub use vision::{
+    VISION_BASE, VisionBarSource, VisionGranularity, VisionTimeUnit, parse_checksum,
+    parse_vision_csv, parse_vision_row, vision_checksum_url, vision_zip_url,
+};
+#[cfg(feature = "vision-zip")]
+pub use vision::{unzip_single_csv, verify_and_unzip};
 pub use ws::{
     WsExecReport, client_order_tag, parse_client_order_tag, parse_execution_report,
     parse_listen_key, parse_ws_kline,
@@ -276,6 +285,50 @@ impl BinanceCatalog {
         Self::parse(json, InstrumentKind::Spot, false)
     }
 
+    /// Fetch spot `/api/v3/exchangeInfo` over `transport` and parse it into a
+    /// catalogue (see [`from_exchange_info`](Self::from_exchange_info)). For USDⓈ-M
+    /// futures use [`fetch_futures`](Self::fetch_futures). The reusable connector
+    /// entry point — callers never build the URL or touch the response body.
+    ///
+    /// # Errors
+    /// [`BinanceError::Transport`] on a transport failure or a non-2xx status;
+    /// [`BinanceError::Parse`] on malformed JSON.
+    pub fn fetch<T: Transport>(transport: &mut T, base_url: &str) -> Result<Self, BinanceError> {
+        let body = Self::get(transport, &format!("{base_url}/api/v3/exchangeInfo"))?;
+        Self::from_exchange_info(&body)
+    }
+
+    /// Fetch USDⓈ-M futures `/fapi/v1/exchangeInfo` over `transport` (pass
+    /// [`FUTURES_BASE_URL`]) and parse it into a perpetual catalogue (see
+    /// [`from_futures_exchange_info`](Self::from_futures_exchange_info)).
+    ///
+    /// # Errors
+    /// [`BinanceError::Transport`] on a transport failure or a non-2xx status;
+    /// [`BinanceError::Parse`] on malformed JSON.
+    pub fn fetch_futures<T: Transport>(
+        transport: &mut T,
+        base_url: &str,
+    ) -> Result<Self, BinanceError> {
+        let body = Self::get(transport, &format!("{base_url}/fapi/v1/exchangeInfo"))?;
+        Self::from_futures_exchange_info(&body)
+    }
+
+    /// Unsigned `GET` returning the body, erroring on a non-2xx status.
+    fn get<T: Transport>(transport: &mut T, url: &str) -> Result<String, BinanceError> {
+        let resp = transport.send(&HttpRequest {
+            method: Method::Get,
+            url: url.to_string(),
+            api_key: None,
+        })?;
+        if !resp.is_success() {
+            return Err(BinanceError::Transport(format!(
+                "exchangeInfo HTTP {}",
+                resp.status
+            )));
+        }
+        Ok(resp.body)
+    }
+
     /// Parse a USDⓈ-M futures `/fapi/v1/exchangeInfo` body into a catalogue of
     /// [`InstrumentKind::PerpetualFuture`]s. Only `TRADING`, `PERPETUAL` contracts
     /// are included (dated futures are skipped); each is assigned a dense
@@ -456,6 +509,10 @@ pub struct BinanceKlineFeed<T> {
     end_ms: Option<i64>,
     limit: u32,
     klines_path: &'static str,
+    /// Inter-page courtesy delay + 429 back-off unit; `0` in tests.
+    page_delay: std::time::Duration,
+    /// Bounded retries on a `429`/`418` (rate-limited) page.
+    max_retries: u32,
     buffer: std::collections::VecDeque<Bar>,
     fetched: bool,
 }
@@ -485,6 +542,8 @@ impl<T: Transport> BinanceKlineFeed<T> {
             end_ms: None,
             limit: 500,
             klines_path: "/api/v3/klines",
+            page_delay: std::time::Duration::from_millis(120),
+            max_retries: 8,
             buffer: std::collections::VecDeque::new(),
             fetched: false,
         }
@@ -514,6 +573,15 @@ impl<T: Transport> BinanceKlineFeed<T> {
         self
     }
 
+    /// Override the inter-page courtesy delay (default 120 ms; also the 429/418
+    /// back-off unit) — matters for long back-fills that take many pages. Set to
+    /// [`Duration::ZERO`](std::time::Duration::ZERO) in tests to page without sleeping.
+    #[must_use]
+    pub fn with_page_delay(mut self, delay: std::time::Duration) -> Self {
+        self.page_delay = delay;
+        self
+    }
+
     fn fetch_page(
         &mut self,
         start: Option<i64>,
@@ -529,23 +597,41 @@ impl<T: Transport> BinanceKlineFeed<T> {
         if let Some(e) = end {
             let _ = write!(q, "&endTime={e}");
         }
-        let resp = self.transport.send(&HttpRequest {
-            method: Method::Get,
-            url: format!("{}{}?{}", self.base_url, self.klines_path, q),
-            api_key: None,
-        })?;
-        if !resp.is_success() {
-            return Err(BinanceError::Transport(format!(
-                "klines HTTP {}",
-                resp.status
-            )));
+        let url = format!("{}{}?{}", self.base_url, self.klines_path, q);
+        // Bounded back-off on a rate-limit (429) / IP-ban (418); zero at `page_delay`
+        // 0 (tests). Klines are an unsigned public request, so a retry is safe.
+        let backoff = if self.page_delay.is_zero() {
+            std::time::Duration::ZERO
+        } else {
+            std::time::Duration::from_secs(2)
+        };
+        let mut retries = 0u32;
+        loop {
+            let resp = self.transport.send(&HttpRequest {
+                method: Method::Get,
+                url: url.clone(),
+                api_key: None,
+            })?;
+            if (resp.status == 429 || resp.status == 418) && retries < self.max_retries {
+                retries += 1;
+                if !backoff.is_zero() {
+                    std::thread::sleep(backoff);
+                }
+                continue;
+            }
+            if !resp.is_success() {
+                return Err(BinanceError::Transport(format!(
+                    "klines HTTP {}",
+                    resp.status
+                )));
+            }
+            return parse_klines(
+                &resp.body,
+                self.instrument,
+                self.price_scale,
+                self.qty_scale,
+            );
         }
-        parse_klines(
-            &resp.body,
-            self.instrument,
-            self.price_scale,
-            self.qty_scale,
-        )
     }
 
     fn fetch(&mut self) -> Result<(), BinanceError> {
@@ -560,6 +646,9 @@ impl<T: Transport> BinanceKlineFeed<T> {
                     break;
                 }
                 cursor = last + 1;
+                if !self.page_delay.is_zero() {
+                    std::thread::sleep(self.page_delay); // pace long back-fills
+                }
             }
         } else {
             let page = self.fetch_page(self.start_ms, self.end_ms)?;
@@ -867,6 +956,47 @@ mod tests {
     }
 
     #[test]
+    fn catalog_fetch_via_transport() {
+        let mut t = MockTransport::new(vec![HttpResponse {
+            status: 200,
+            body: EXCHANGE_INFO.into(),
+        }]);
+        let cat = BinanceCatalog::fetch(&mut t, "http://x").unwrap();
+        assert!(cat.id_of("BTCUSDT").is_some());
+        assert!(t.sent[0].url.ends_with("/api/v3/exchangeInfo"));
+        assert!(t.sent[0].api_key.is_none()); // public — unsigned
+        let mut bad = MockTransport::new(vec![HttpResponse {
+            status: 503,
+            body: String::new(),
+        }]);
+        assert!(BinanceCatalog::fetch(&mut bad, "http://x").is_err());
+    }
+
+    #[test]
+    fn kline_feed_retries_on_429() {
+        let mut feed = BinanceKlineFeed::new(
+            MockTransport::new(vec![
+                HttpResponse {
+                    status: 429,
+                    body: String::new(),
+                },
+                HttpResponse {
+                    status: 200,
+                    body: r#"[[1700000000000,"100","100","100","100","1",1700000059999,"x",1,"y","z","0"]]"#.into(),
+                },
+            ]),
+            "http://x",
+            "BTCUSDT",
+            InstrumentId::new(0),
+            "1m",
+            2,
+            0,
+        )
+        .with_page_delay(std::time::Duration::ZERO);
+        assert!(feed.next_event().is_some()); // survived the 429
+    }
+
+    #[test]
     fn klines_parse_to_bars() {
         let json = r#"[[1700000000000,"100.00","102.00","99.50","101.25","12.5",1700000059999,"x",1,"y","z","0"]]"#;
         let bars = parse_klines(json, InstrumentId::new(0), 2, 1).unwrap();
@@ -896,6 +1026,55 @@ mod tests {
             0,
         );
         assert!(feed.next_event().is_some());
+        assert!(feed.next_event().is_none());
+    }
+
+    #[test]
+    fn kline_feed_range_no_forward_progress_terminates() {
+        // A page whose last close is at/before the cursor must not loop forever
+        // (the `last <= cursor` guard). Here closeTime == start.
+        let body =
+            r#"[[1700000000000,"100","100","100","100","1",1700000000000,"x",1,"y","z","0"]]"#;
+        let mut feed = BinanceKlineFeed::new(
+            MockTransport::new(vec![HttpResponse {
+                status: 200,
+                body: body.into(),
+            }]),
+            "http://x",
+            "BTCUSDT",
+            InstrumentId::new(0),
+            "1m",
+            2,
+            0,
+        )
+        .with_range(1_700_000_000_000, 1_700_001_000_000)
+        .with_page_delay(std::time::Duration::ZERO);
+        let mut n = 0;
+        while feed.next_event().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 1); // single bar; no-forward-progress guard ended the loop
+    }
+
+    #[test]
+    fn kline_feed_429_exhausted_yields_none() {
+        let mut feed = BinanceKlineFeed::new(
+            MockTransport::new(
+                (0..10)
+                    .map(|_| HttpResponse {
+                        status: 429,
+                        body: String::new(),
+                    })
+                    .collect(),
+            ),
+            "http://x",
+            "BTCUSDT",
+            InstrumentId::new(0),
+            "1m",
+            2,
+            0,
+        )
+        .with_page_delay(std::time::Duration::ZERO);
         assert!(feed.next_event().is_none());
     }
 

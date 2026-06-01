@@ -2,12 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Playground: run a simple SMA-crossover strategy over **real** MEXC klines.
+//! Playground: run a simple SMA-crossover strategy over historical klines.
 //!
 //! The live-data sibling of the `two_week_15m_backtest` integration test. It
-//! pulls genuine historical candles from `api.mexc.com` through the
-//! `akadro-venue-mexc` connector and runs them through the real engine, so the
-//! numbers reflect actual market action.
+//! pulls genuine historical candles from a venue — MEXC spot (`--venue mexc`,
+//! `api.mexc.com`) or OKX spot/swap (`--venue okx`, paged `history-candles`,
+//! supports `1s`) — through the matching `akadro-venue-*` connector and runs them
+//! through the engine, so the numbers reflect actual market action.
 //!
 //! **All parameters are runtime-configurable — no recompile needed.** Settings
 //! are resolved as: built-in defaults → `playground.toml` (if present in the
@@ -39,7 +40,9 @@ use akadro::analytics::{PerformanceReport, TradeStats};
 use akadro::backtest::{diff_reports, replay_trades};
 use akadro::data::load_or_cache;
 use akadro::prelude::*;
-use akadro_venue_mexc::{MexcCatalog, MexcKlineFeed, ReqwestTransport};
+use akadro::types::{AssetId, InstrumentKind, InstrumentSpec, Timestamp};
+use akadro_venue_mexc::{self as mexc, MexcCatalog, MexcKlineFeed, ReqwestTransport};
+use akadro_venue_okx as okx;
 
 type Err = Box<dyn Error>;
 
@@ -52,6 +55,10 @@ const RUN_ARTEFACTS_DIR: &str = "run_artefacts";
 /// Every tunable, resolved from defaults / config file / CLI at runtime.
 #[derive(Debug, Clone)]
 struct Config {
+    /// Data venue: `mexc` (spot REST klines), `mexc-futures` (perpetual contract
+    /// klines + funding, symbol e.g. `BTC_USDT`), or `okx` (paged history-candles,
+    /// supports `1s`, perp funding on `…-SWAP`).
+    venue: String,
     base_url: String,
     symbol: String,
     interval: String,
@@ -67,14 +74,30 @@ struct Config {
     deploy_pct: i64,
     /// Enforce the cash balance (reject unaffordable buys).
     enforce_cash: bool,
+    /// Accrue perpetual **funding** from the venue's funding-rate history (OKX
+    /// `…-SWAP` and `mexc-futures`; ignored for spot). On by default for perps.
+    funding: bool,
     /// If non-empty, save the `RunReport` JSON under `run_artefacts/` (loadable
     /// later). A bare file name is placed in that dir; an absolute path is honoured.
     save_report: String,
+    /// Re-run the backtest this many times and report the fastest (a warm,
+    /// steady-state benchmark — a single sub-100ms run is dominated by CPU
+    /// turbo-ramp + cold-cache and understates throughput).
+    repeat: usize,
+    /// Diagnostic: run the *identical* loaded bars through the engine twice —
+    /// once as `Spot`, once as `PerpetualFuture` — to isolate instrument-kind
+    /// per-bar cost from data/strategy effects, then exit.
+    bench_kind_ab: bool,
+    /// Diagnostic: if set to another (cached) OKX symbol, benchmark the primary
+    /// `symbol` and this one **interleaved in a single process** (A,B,A,B…),
+    /// removing cross-invocation machine drift, then exit.
+    bench_vs: String,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
+            venue: "mexc".to_string(),
             base_url: "https://api.mexc.com".to_string(),
             symbol: "BTCUSDT".to_string(),
             interval: "5m".to_string(),
@@ -86,7 +109,11 @@ impl Default for Config {
             cash: 1_000_000,
             deploy_pct: 90,
             enforce_cash: true,
+            funding: true,
             save_report: String::new(),
+            repeat: 1,
+            bench_kind_ab: false,
+            bench_vs: String::new(),
         }
     }
 }
@@ -94,6 +121,7 @@ impl Default for Config {
 /// One bar length in milliseconds for a MEXC interval string.
 fn interval_ms(iv: &str) -> Result<i64, Err> {
     Ok(match iv {
+        "1s" => 1_000,
         "1m" => 60_000,
         "5m" => 300_000,
         "15m" => 900_000,
@@ -144,11 +172,12 @@ where
 
 fn print_usage() {
     eprintln!(
-        "playground — run the SMA-crossover backtest over real MEXC data.\n\n\
+        "playground — run the SMA-crossover backtest over MEXC data.\n\n\
          Resolution: defaults < playground.toml (cwd or --config) < --flag value.\n\n\
          Flags (all optional):\n  \
-           --symbol <S>        venue symbol            (default BTCUSDT)\n  \
-           --interval <I>      1m|5m|15m|30m|1h|4h|1d  (default 5m)\n  \
+           --venue <V>         mexc|mexc-futures|okx   (default mexc)\n  \
+           --symbol <S>        venue symbol            (default BTCUSDT; okx BTC-USDT-SWAP; mexc-futures BTC_USDT)\n  \
+           --interval <I>      1s|1m|5m|15m|30m|1h|4h|1d (default 5m; 1s = okx only)\n  \
            --start <D>         YYYY-MM-DD or epoch-ms  (default 2025-05-01)\n  \
            --end <D>           YYYY-MM-DD or epoch-ms  (default 2026-05-01)\n  \
            --fast <N>          fast SMA window (bars)  (default 48)\n  \
@@ -157,6 +186,8 @@ fn print_usage() {
            --cash <N>          starting cash, quote    (default 1000000)\n  \
            --deploy-pct <N>    %% of capital deployed  (default 90)\n  \
            --enforce-cash <B>  true|false cash guard   (default true)\n  \
+           --funding <B>       accrue OKX perp funding (default true; swap only)\n  \
+           --repeat <N>        re-run N times, report fastest (warm benchmark)\n  \
            --save-report <P>   save the RunReport JSON as run_artefacts/P (loadable later)\n  \
            --base-url <U>      REST base URL\n  \
            --config <path>     load a TOML-ish key=value file\n  \
@@ -224,6 +255,7 @@ fn load_config() -> Result<Config, Err> {
     let d = Config::default();
     let get_str = |k: &str, def: &str| map.get(k).cloned().unwrap_or_else(|| def.to_string());
     Ok(Config {
+        venue: get_str("venue", &d.venue),
         base_url: get_str("base_url", &d.base_url),
         symbol: get_str("symbol", &d.symbol),
         interval: get_str("interval", &d.interval),
@@ -235,7 +267,11 @@ fn load_config() -> Result<Config, Err> {
         cash: parse_or(&map, "cash", d.cash)?,
         deploy_pct: parse_or(&map, "deploy_pct", d.deploy_pct)?,
         enforce_cash: parse_or(&map, "enforce_cash", d.enforce_cash)?,
+        funding: parse_or(&map, "funding", d.funding)?,
         save_report: get_str("save_report", &d.save_report),
+        repeat: parse_or(&map, "repeat", d.repeat)?,
+        bench_kind_ab: parse_or(&map, "bench_kind_ab", d.bench_kind_ab)?,
+        bench_vs: get_str("bench_vs", &d.bench_vs),
     })
 }
 
@@ -353,6 +389,278 @@ fn erfc(x: f64) -> f64 {
     if x >= 0.0 { 1.0 - erf } else { 1.0 + erf }
 }
 
+// --- venue data loading --------------------------------------------------------
+
+/// What every venue loader returns: the dense specs (for the engine), the resolved
+/// instrument + its scales, and the bars (downloaded or from the on-disk cache).
+type Market = (Vec<InstrumentSpec>, InstrumentId, u32, u32, Vec<Bar>);
+
+/// MEXC spot REST klines (the connector paginates + the data layer caches).
+fn load_mexc(cfg: &Config, cache_path: &std::path::Path) -> Result<Market, Err> {
+    let mut transport = ReqwestTransport::new()?;
+    eprintln!("[mexc] exchangeInfo for {} ...", cfg.symbol);
+    let catalog = MexcCatalog::fetch(&mut transport, &cfg.base_url, &cfg.symbol)?;
+    let instrument = catalog
+        .id_of(&cfg.symbol)
+        .ok_or("symbol not present / not tradable")?;
+    let (price_scale, qty_scale) = catalog.scales(instrument).ok_or("no scales")?;
+    let (base, sym, iv, start, end) = (
+        cfg.base_url.clone(),
+        cfg.symbol.clone(),
+        cfg.interval.clone(),
+        cfg.start,
+        cfg.end,
+    );
+    eprintln!(
+        "[mexc] loading {} {} klines (cache or download) ...",
+        cfg.symbol, cfg.interval
+    );
+    let bars = load_or_cache(cache_path, instrument, price_scale, qty_scale, move || {
+        MexcKlineFeed::new(
+            ReqwestTransport::new().expect("transport"),
+            base,
+            sym,
+            instrument,
+            iv,
+            price_scale,
+            qty_scale,
+        )
+        .with_range(start, end)
+        .with_limit(1000)
+    })?;
+    Ok((
+        catalog.specs().to_vec(),
+        instrument,
+        price_scale,
+        qty_scale,
+        bars,
+    ))
+}
+
+/// MEXC **futures** (perpetual contract) klines via the contract API
+/// (`contract.mexc.com`). The symbol is the contract form, e.g. `BTC_USDT`; the
+/// `PerpetualFuture` `InstrumentSpec` comes from the futures catalogue
+/// (`contract/detail`) and bars from the paged `MexcFuturesKlineFeed`, cached by the
+/// data layer. The connector owns every request — the playground only orchestrates.
+fn load_mexc_futures(cfg: &Config, cache_path: &std::path::Path) -> Result<Market, Err> {
+    let base = mexc::FUTURES_BASE_URL.to_string();
+    let mut transport = ReqwestTransport::new()?;
+    eprintln!("[mexc-futures] contract/detail for {} ...", cfg.symbol);
+    let contract = mexc::fetch_contracts(&mut transport, &base)?
+        .into_iter()
+        .find(|c| c.symbol == cfg.symbol)
+        .ok_or("mexc futures contract not found / not tradable (try e.g. BTC_USDT)")?;
+    let (price_scale, qty_scale) = (contract.price_scale, contract.qty_scale);
+    let instrument = InstrumentId::new(0);
+    let spec = contract.to_spec(instrument, AssetId::new(0), AssetId::new(1));
+    let (sym, iv, start, end) = (cfg.symbol.clone(), cfg.interval.clone(), cfg.start, cfg.end);
+    eprintln!(
+        "[mexc-futures] {} {} contract klines (cache or download) ...",
+        cfg.symbol, cfg.interval
+    );
+    let bars = load_or_cache(cache_path, instrument, price_scale, qty_scale, move || {
+        mexc::MexcFuturesKlineFeed::new(
+            ReqwestTransport::new().expect("transport"),
+            base,
+            sym,
+            instrument,
+            iv,
+            price_scale,
+            qty_scale,
+        )
+        .with_range(start, end)
+    })?;
+    Ok((vec![spec], instrument, price_scale, qty_scale, bars))
+}
+
+/// OKX paged `history-candles` (spot or perpetual swap; supports `1s`). The
+/// instrument type is inferred from the instId: `…-SWAP` is a perpetual, anything
+/// else is treated as spot — so `BTC-USDT-SWAP` and `BTC-USDT` give a perp and a
+/// spot `InstrumentSpec` respectively (the only difference being the instrument
+/// `kind` the engine/exchange see).
+fn load_okx(cfg: &Config, cache_path: &std::path::Path) -> Result<Market, Err> {
+    let inst_type = if cfg.symbol.ends_with("-SWAP") {
+        okx::InstType::Swap
+    } else {
+        okx::InstType::Spot
+    };
+    let mut transport = okx::ReqwestTransport::new()?;
+    eprintln!("[okx] instruments ({}) ...", inst_type.query());
+    let catalog = okx::OkxCatalog::fetch(&mut transport, &cfg.base_url, inst_type)?;
+    let instrument = catalog
+        .id_of(&cfg.symbol)
+        .ok_or("okx instId not present / not live (try e.g. BTC-USDT-SWAP)")?;
+    let (price_scale, qty_scale) = catalog.scales(instrument).ok_or("no scales")?;
+    let bar_ms = interval_ms(&cfg.interval)?;
+    let (base, sym, iv, start, end) = (
+        cfg.base_url.clone(),
+        cfg.symbol.clone(),
+        cfg.interval.clone(),
+        cfg.start,
+        cfg.end,
+    );
+    eprintln!(
+        "[okx] {} {} via history-candles (cache or download; ~{} pages for a day of 1s) ...",
+        cfg.symbol,
+        cfg.interval,
+        (end - start) / bar_ms / 100
+    );
+    let bars = load_or_cache(cache_path, instrument, price_scale, qty_scale, move || {
+        okx::OkxCandleFeed::new(
+            okx::ReqwestTransport::new().expect("transport"),
+            base,
+            sym,
+            instrument,
+            iv,
+            price_scale,
+            qty_scale,
+        )
+        .with_range(start, end)
+    })?;
+    Ok((
+        catalog.specs().to_vec(),
+        instrument,
+        price_scale,
+        qty_scale,
+        bars,
+    ))
+}
+
+/// Fetch OKX funding-rate history for the perp and turn it into a
+/// `(schedule, interval_bars)` for `SimulatedExchange::with_funding_schedule`.
+/// The settlement cadence (8h on most OKX perps, 4h on some) is derived from the
+/// gaps between settlements; `interval_bars` is that period expressed in `bar_ms`
+/// bars, so funding accrues at the right rhythm for any interval.
+fn okx_funding(cfg: &Config, bar_ms: i64) -> Result<(Vec<(Timestamp, i64)>, u32), Err> {
+    let mut transport = okx::ReqwestTransport::new()?;
+    let schedule = okx::fetch_funding_history(&mut transport, &cfg.base_url, &cfg.symbol, 100)?;
+    // Period (8h on most OKX perps, 4h on some) → `interval_bars` for the engine.
+    let period_ms = okx::funding_period_ms(&schedule);
+    let interval_bars = u32::try_from((period_ms / bar_ms).max(1)).unwrap_or(u32::MAX);
+    Ok((schedule, interval_bars))
+}
+
+/// Fetch MEXC perpetual funding-rate history (paged to cover the backtest window)
+/// and turn it into a `(schedule, interval_bars)` for `with_funding_schedule`.
+/// MEXC pages 100 settlements (~33 days at 8h) each, so a year needs ~11 pages.
+fn mexc_futures_funding(cfg: &Config, bar_ms: i64) -> Result<(Vec<(Timestamp, i64)>, u32), Err> {
+    let mut transport = ReqwestTransport::new()?;
+    // ~3 settlements/day (8h cadence), 100 per page → pages to span the window + margin.
+    let days = ((cfg.end - cfg.start).max(0) / 86_400_000) + 1;
+    let pages = u32::try_from((days * 3 / 100) + 2).unwrap_or(2);
+    let schedule = mexc::fetch_funding_history_paged(
+        &mut transport,
+        mexc::FUTURES_BASE_URL,
+        &cfg.symbol,
+        pages,
+    )?;
+    // Settlement period = smallest positive gap between settlements (ms); fall back
+    // to MEXC's standard 8h if too few points to infer it.
+    let period_ms = schedule
+        .windows(2)
+        .map(|w| w[1].0.as_nanos() / 1_000_000 - w[0].0.as_nanos() / 1_000_000)
+        .filter(|d| *d > 0)
+        .min()
+        .unwrap_or(28_800_000);
+    let interval_bars = u32::try_from((period_ms / bar_ms).max(1)).unwrap_or(u32::MAX);
+    Ok((schedule, interval_bars))
+}
+
+/// Diagnostic A/B: run the SAME bars through the engine as `Spot` then as
+/// `PerpetualFuture` (only the instrument `kind` differs), each `runs` times,
+/// reporting the fastest. Isolates per-bar instrument-kind cost from data/strategy
+/// differences between two separately-downloaded datasets.
+fn bench_kind_ab(
+    specs: &[InstrumentSpec],
+    instrument: InstrumentId,
+    bars: &[Bar],
+    cash_raw: i128,
+    cfg: &Config,
+) -> Result<(), Err> {
+    let runs = cfg.repeat.max(8);
+    let idx = instrument.index() as usize;
+    eprintln!(
+        "kind A/B: {} bars, identical data, only instrument kind flipped, {runs} reps each",
+        bars.len()
+    );
+    for kind in [InstrumentKind::Spot, InstrumentKind::PerpetualFuture] {
+        let mut specs2 = specs.to_vec();
+        specs2[idx].kind = kind;
+        let mut best_ms = f64::MAX;
+        for _ in 0..runs {
+            let strategy = SmaCrossover::new(instrument, cfg.fast, cfg.slow, cfg.deploy_pct);
+            let mut exchange = SimulatedExchange::new(specs2.clone(), cfg.fee_bps);
+            if cfg.enforce_cash {
+                exchange = exchange.with_starting_cash(Money::from_raw(cash_raw));
+            }
+            let engine = Engine::new(
+                &specs2,
+                Money::from_raw(cash_raw),
+                HistoricalFeed::from_bars(bars.to_vec()),
+                exchange,
+                strategy,
+            )?;
+            let t0 = std::time::Instant::now();
+            let _ = engine.run();
+            best_ms = best_ms.min(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        eprintln!(
+            "  {:<16?}: fastest {best_ms:>8.3} ms  ({:.0} bars/sec)",
+            kind,
+            bars.len() as f64 / (best_ms / 1000.0)
+        );
+    }
+    Ok(())
+}
+
+/// Time one `engine.run()` over `m`'s bars (ms); rebuild is outside the timed span.
+fn time_run(m: &Market, cfg: &Config, cash_raw: i128) -> Result<f64, Err> {
+    let (specs, instrument, _ps, _qs, bars) = m;
+    let strategy = SmaCrossover::new(*instrument, cfg.fast, cfg.slow, cfg.deploy_pct);
+    let mut exchange = SimulatedExchange::new(specs.clone(), cfg.fee_bps);
+    if cfg.enforce_cash {
+        exchange = exchange.with_starting_cash(Money::from_raw(cash_raw));
+    }
+    let engine = Engine::new(
+        specs,
+        Money::from_raw(cash_raw),
+        HistoricalFeed::from_bars(bars.clone()),
+        exchange,
+        strategy,
+    )?;
+    let t0 = std::time::Instant::now();
+    let _ = engine.run();
+    Ok(t0.elapsed().as_secs_f64() * 1000.0)
+}
+
+/// Interleaved in-process A/B of two datasets (alternate A,B,A,B…) — removes all
+/// cross-invocation machine drift, so a surviving gap is a genuine per-dataset cost.
+fn bench_interleaved(la: &str, a: &Market, lb: &str, b: &Market, cfg: &Config) -> Result<(), Err> {
+    let runs = cfg.repeat.max(12);
+    let cash = |m: &Market| cfg.cash * 10i128.pow(m.2 + m.3);
+    let (ca, cb) = (cash(a), cash(b));
+    let (mut best_a, mut best_b) = (f64::MAX, f64::MAX);
+    eprintln!(
+        "interleaved A/B in ONE process: {la} ({} bars) vs {lb} ({} bars), {runs} reps each",
+        a.4.len(),
+        b.4.len()
+    );
+    for _ in 0..runs {
+        best_a = best_a.min(time_run(a, cfg, ca)?);
+        best_b = best_b.min(time_run(b, cfg, cb)?);
+    }
+    let rate = |m: &Market, ms: f64| m.4.len() as f64 / (ms / 1000.0);
+    eprintln!(
+        "  A {la:<16}: fastest {best_a:>8.3} ms  ({:.0} bars/sec)",
+        rate(a, best_a)
+    );
+    eprintln!(
+        "  B {lb:<16}: fastest {best_b:>8.3} ms  ({:.0} bars/sec)",
+        rate(b, best_b)
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)] // linear load → fetch → run → report script
 fn main() -> Result<(), Err> {
     let cfg = load_config()?;
@@ -360,51 +668,24 @@ fn main() -> Result<(), Err> {
     let periods_per_year = 365.0 * 86_400_000.0 / bar_ms as f64;
     eprintln!("config: {cfg:?}");
 
-    let mut transport = ReqwestTransport::new()?;
-
-    // 1. Resolve the real instrument via the connector's exchangeInfo helper.
-    eprintln!("Fetching exchangeInfo for {} ...", cfg.symbol);
-    let catalog = MexcCatalog::fetch(&mut transport, &cfg.base_url, &cfg.symbol)?;
-    let instrument = catalog
-        .id_of(&cfg.symbol)
-        .ok_or("symbol not present / not tradable")?;
-    let (price_scale, qty_scale) = catalog.scales(instrument).ok_or("no scales")?;
-    let money_scale = price_scale + qty_scale;
-
-    // 2. Download-and-cache (or load from cache) the candles — the library does
-    //    the pagination and the on-disk caching; the user just asks for a range.
-    // Cached under a local `market_data/` dir (git-ignored), keyed by the full
-    // range so different windows don't collide on disk.
+    // 1 + 2. Resolve the instrument and download-and-cache (or load) the candles
+    //    for the chosen venue. Cached under a local `market_data/` dir (git-ignored),
+    //    keyed by venue + symbol + interval + range so windows don't collide.
     let cache_dir = std::path::Path::new("market_data");
     std::fs::create_dir_all(cache_dir)?;
     let cache_path = cache_dir.join(format!(
-        "{}_{}_{}_{}.feather",
-        cfg.symbol, cfg.interval, cfg.start, cfg.end
+        "{}_{}_{}_{}_{}.feather",
+        cfg.venue, cfg.symbol, cfg.interval, cfg.start, cfg.end
     ));
-    eprintln!(
-        "Loading {} {} klines (cache or download) ...",
-        cfg.symbol, cfg.interval
-    );
-    let (base_url, symbol, interval) = (
-        cfg.base_url.clone(),
-        cfg.symbol.clone(),
-        cfg.interval.clone(),
-    );
-    let (start, end) = (cfg.start, cfg.end);
-    let bars = load_or_cache(&cache_path, instrument, price_scale, qty_scale, move || {
-        let t = ReqwestTransport::new().expect("transport");
-        MexcKlineFeed::new(
-            t,
-            base_url,
-            symbol,
-            instrument,
-            interval,
-            price_scale,
-            qty_scale,
-        )
-        .with_range(start, end)
-        .with_limit(1000)
-    })?;
+    let (specs, instrument, price_scale, qty_scale, bars) = match cfg.venue.as_str() {
+        "okx" => load_okx(&cfg, &cache_path)?,
+        "mexc" => load_mexc(&cfg, &cache_path)?,
+        "mexc-futures" => load_mexc_futures(&cfg, &cache_path)?,
+        other => {
+            return Err(format!("unknown venue '{other}' (mexc|mexc-futures|okx)").into());
+        }
+    };
+    let money_scale = price_scale + qty_scale;
     assert!(!bars.is_empty(), "no bars returned");
     let first = &bars[0];
     let last = &bars[bars.len() - 1];
@@ -418,24 +699,117 @@ fn main() -> Result<(), Err> {
     let p0 = first.open.raw() as i128;
     let first_entry_est = (cash_raw * i128::from(cfg.deploy_pct) / 100 / p0) as i64;
     assert!(first_entry_est > 0, "position sizing underflowed");
-    let strategy = SmaCrossover::new(instrument, cfg.fast, cfg.slow, cfg.deploy_pct);
 
-    let mut exchange = SimulatedExchange::new(catalog.specs().to_vec(), cfg.fee_bps);
-    if cfg.enforce_cash {
-        exchange = exchange.with_starting_cash(Money::from_raw(cash_raw));
+    // Diagnostic: isolate instrument-kind per-bar cost on identical data, then exit.
+    if cfg.bench_kind_ab {
+        return bench_kind_ab(&specs, instrument, &bars, cash_raw, &cfg);
     }
-    let engine = Engine::new(
-        catalog.specs(),
-        Money::from_raw(cash_raw),
-        HistoricalFeed::from_bars(bars.clone()),
-        exchange,
-        strategy,
-    )?;
 
-    // 4. Time ONLY the backtest (engine loop + fills + equity marking).
-    let t0 = std::time::Instant::now();
-    let report = engine.run();
-    let backtest_time = t0.elapsed();
+    // Diagnostic: interleave two datasets in ONE process (removes machine drift).
+    if !cfg.bench_vs.is_empty() {
+        let mut cfg_b = cfg.clone();
+        cfg_b.symbol.clone_from(&cfg.bench_vs);
+        let cache_b = cache_dir.join(format!(
+            "{}_{}_{}_{}_{}.feather",
+            cfg_b.venue, cfg_b.symbol, cfg_b.interval, cfg_b.start, cfg_b.end
+        ));
+        let b = load_okx(&cfg_b, &cache_b)?;
+        let a: Market = (
+            specs.clone(),
+            instrument,
+            price_scale,
+            qty_scale,
+            bars.clone(),
+        );
+        return bench_interleaved(&cfg.symbol, &a, &cfg.bench_vs, &b, &cfg);
+    }
+    // 4. Time ONLY the backtest (engine loop + fills + equity marking). Optionally
+    //    repeat (`--repeat N`): a single sub-100ms run is a poor benchmark — CPU
+    //    turbo takes tens of ms to ramp and the i-cache/branch-predictor start cold,
+    //    so the first run understates steady-state throughput. We rebuild the engine
+    //    each iteration (the rebuild + `bars.clone()` are OUTSIDE the timed region)
+    //    and report the fastest run as the representative figure.
+    // Perpetual funding: for an OKX swap, pull the venue's funding-rate history and
+    // accrue it on the held position (longs pay shorts when the rate is positive).
+    // Empty for spot / MEXC / when disabled, in which case funding stays 0.
+    let (funding_sched, funding_interval) = if cfg.funding
+        && cfg.venue == "okx"
+        && cfg.symbol.ends_with("-SWAP")
+    {
+        match okx_funding(&cfg, bar_ms) {
+            Ok((s, iv)) => {
+                eprintln!(
+                    "[okx] funding: {} settlements loaded, accruing every {iv} bars (~{}h)",
+                    s.len(),
+                    iv as i64 * bar_ms / 3_600_000
+                );
+                (s, iv)
+            }
+            Err(e) => {
+                eprintln!("[okx] funding fetch failed ({e}); running with funding = 0");
+                (Vec::new(), 0)
+            }
+        }
+    } else if cfg.funding && cfg.venue == "mexc-futures" {
+        match mexc_futures_funding(&cfg, bar_ms) {
+            Ok((s, iv)) => {
+                eprintln!(
+                    "[mexc-futures] funding: {} settlements loaded, accruing every {iv} bars (~{}h)",
+                    s.len(),
+                    iv as i64 * bar_ms / 3_600_000
+                );
+                (s, iv)
+            }
+            Err(e) => {
+                eprintln!("[mexc-futures] funding fetch failed ({e}); running with funding = 0");
+                (Vec::new(), 0)
+            }
+        }
+    } else {
+        (Vec::new(), 0)
+    };
+
+    let runs = cfg.repeat.max(1);
+    let (report, backtest_time) = {
+        let mut best: Option<(RunReport, std::time::Duration)> = None;
+        for run_idx in 0..runs {
+            let strategy = SmaCrossover::new(instrument, cfg.fast, cfg.slow, cfg.deploy_pct);
+            let mut exchange = SimulatedExchange::new(specs.clone(), cfg.fee_bps);
+            if cfg.enforce_cash {
+                exchange = exchange.with_starting_cash(Money::from_raw(cash_raw));
+            }
+            if !funding_sched.is_empty() {
+                exchange = exchange.with_funding_schedule(
+                    instrument,
+                    funding_interval,
+                    funding_sched.clone(),
+                );
+            }
+            let engine = Engine::new(
+                &specs,
+                Money::from_raw(cash_raw),
+                HistoricalFeed::from_bars(bars.clone()),
+                exchange,
+                strategy,
+            )?;
+            let t0 = std::time::Instant::now();
+            let r = engine.run();
+            let dt = t0.elapsed();
+            if runs > 1 {
+                eprintln!(
+                    "  bench run #{:<2}: {dt:>12.3?}  ({:.0} bars/sec)",
+                    run_idx + 1,
+                    bars.len() as f64 / dt.as_secs_f64().max(1e-9)
+                );
+            }
+            // Keep the fastest run (steady-state), and its report (all runs are
+            // bit-identical — determinism — so any report is fine).
+            if best.as_ref().is_none_or(|(_, b)| dt < *b) {
+                best = Some((r, dt));
+            }
+        }
+        best.expect("runs >= 1")
+    };
 
     // 5. The candles are already cached on disk by `load_or_cache` above.
     let on_disk = std::fs::metadata(&cache_path)?.len();
@@ -453,8 +827,10 @@ fn main() -> Result<(), Err> {
     let px = |p: i64| p as f64 / 10f64.powi(price_scale as i32);
 
     println!(
-        "\n=========  {} {} — real MEXC backtest  =========",
-        cfg.symbol, cfg.interval
+        "\n=========  {} {} — {} backtest  =========",
+        cfg.symbol,
+        cfg.interval,
+        cfg.venue.to_uppercase()
     );
     println!("  window (req)     : {} .. {} ms", cfg.start, cfg.end);
     println!(
@@ -510,10 +886,18 @@ fn main() -> Result<(), Err> {
         trades.win_rate * 100.0,
         trades.profit_factor
     );
-    let secs = backtest_time.as_secs_f64().max(1e-9);
+    let elapsed_secs = backtest_time.as_secs_f64().max(1e-9);
     println!(
         "  backtest runtime : {backtest_time:?}  ({:.0} bars/sec; excludes download & caching)",
-        bars.len() as f64 / secs
+        bars.len() as f64 / elapsed_secs
+    );
+    // A debug build (`cargo run` without `--release`) is ~30-50× slower here:
+    // opt-level 0 + overflow-checks + debug-assertions dominate the integer money
+    // math. The bars/sec above is NOT representative unless this is a release build.
+    #[cfg(debug_assertions)]
+    println!(
+        "  ⚠ build          : DEBUG — speed is ~30-50x slower than release; \
+         re-run with `cargo run --release` for a representative bars/sec"
     );
     println!(
         "  starting equity  : ~{:.2}  ->  final ~{:.2}  ({ret_pct:+.2}%)",
@@ -589,7 +973,7 @@ fn main() -> Result<(), Err> {
         println!("  report directory : {dir}");
 
         // Record/replay regression oracle: re-drive the *trades* from the on-disk
-        // report through the real engine + simulated exchange — with NO strategy
+        // report through the engine + simulated exchange — with NO strategy
         // logic — and confirm the rebuilt-from-zero result matches. Run the saved
         // report through this with an old vs a new binary to catch an unintended
         // (or a silently-absent) change to trade-simulation behaviour.

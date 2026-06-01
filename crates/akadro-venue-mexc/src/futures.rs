@@ -196,36 +196,32 @@ pub const FUTURES_BASE_URL: &str = "https://contract.mexc.com";
 /// kline token (`"Min1"`, `"Hour4"`, …), or `None` if unrecognized.
 #[must_use]
 pub fn futures_interval(interval: &str) -> Option<&'static str> {
+    futures_interval_entry(interval).map(|(token, _)| token)
+}
+
+/// The single source of truth for the MEXC futures interval mapping:
+/// `(kline token, bar seconds)` for an akadro interval, or `None` if unrecognized.
+/// `futures_interval` and `futures_interval_secs` both derive from it (DRY) so the
+/// token and the duration can never disagree.
+fn futures_interval_entry(interval: &str) -> Option<(&'static str, i64)> {
     Some(match interval {
-        "1m" => "Min1",
-        "5m" => "Min5",
-        "15m" => "Min15",
-        "30m" => "Min30",
-        "60m" | "1h" => "Min60",
-        "4h" => "Hour4",
-        "8h" => "Hour8",
-        "1d" => "Day1",
-        "1W" => "Week1",
-        "1M" => "Month1",
+        "1m" => ("Min1", 60),
+        "5m" => ("Min5", 300),
+        "15m" => ("Min15", 900),
+        "30m" => ("Min30", 1_800),
+        "60m" | "1h" => ("Min60", 3_600),
+        "4h" => ("Hour4", 14_400),
+        "8h" => ("Hour8", 28_800),
+        "1d" => ("Day1", 86_400),
+        "1W" => ("Week1", 604_800),
+        "1M" => ("Month1", 2_592_000),
         _ => return None,
     })
 }
 
 /// One bar length in **seconds** for an akadro interval, or `0` if unrecognized.
 fn futures_interval_secs(interval: &str) -> i64 {
-    match interval {
-        "1m" => 60,
-        "5m" => 300,
-        "15m" => 900,
-        "30m" => 1_800,
-        "60m" | "1h" => 3_600,
-        "4h" => 14_400,
-        "8h" => 28_800,
-        "1d" => 86_400,
-        "1W" => 604_800,
-        "1M" => 2_592_000,
-        _ => 0,
-    }
+    futures_interval_entry(interval).map_or(0, |(_, secs)| secs)
 }
 
 #[derive(Deserialize)]
@@ -315,6 +311,191 @@ pub fn parse_futures_klines(
     Ok(bars)
 }
 
+// --- futures funding-rate history --------------------------------------------
+
+/// Funding-rate fixed-point scale — re-exported from `akadro-core` so the connector
+/// and the engine's `mul_rate` charge cannot drift. Rates normalize to `1e-8`
+/// fractions: MEXC's `0.0001` (1 bp) → `10_000`, and a sub-bp `0.0000466` → `4_660`
+/// instead of rounding to `0`. See `SimulatedExchange::with_funding_schedule`.
+pub use akadro_core::FUNDING_RATE_SCALE;
+
+#[derive(Deserialize)]
+struct FuturesFundingResp {
+    #[serde(default)]
+    success: bool,
+    data: Option<FuturesFundingData>,
+}
+#[derive(Deserialize)]
+struct FuturesFundingData {
+    #[serde(rename = "resultList", default)]
+    result_list: Vec<FuturesFundingRow>,
+}
+#[derive(Deserialize)]
+struct FuturesFundingRow {
+    #[serde(rename = "fundingRate")]
+    funding_rate: serde_json::Value,
+    #[serde(rename = "settleTime")]
+    settle_time: i64,
+}
+
+/// Convert a JSON funding rate (the contract API returns a number, but a string is
+/// accepted too) to a raw fixed-point value at [`FUNDING_RATE_SCALE`]. A JSON number
+/// is rendered to a fixed (non-exponential) decimal first, so a tiny sub-bp rate is
+/// not emitted as `1e-7` and no `f64` reaches the money path beyond this single
+/// venue-data boundary parse.
+fn funding_rate_to_raw(v: &serde_json::Value) -> Result<i64, MexcError> {
+    match v {
+        serde_json::Value::String(s) => decimal_to_raw(s, FUNDING_RATE_SCALE),
+        serde_json::Value::Number(n) => {
+            let f = n
+                .as_f64()
+                .ok_or_else(|| MexcError::Parse("funding rate not numeric".into()))?;
+            decimal_to_raw(&format!("{f:.18}"), FUNDING_RATE_SCALE)
+        }
+        other => Err(MexcError::Parse(format!("bad fundingRate {other}"))),
+    }
+}
+
+/// Parse a MEXC futures `GET /api/v1/contract/funding_rate/history` body into an
+/// ascending `(timestamp, rate)` schedule for `SimulatedExchange::with_funding_schedule`.
+/// Rates are at [`FUNDING_RATE_SCALE`] (`1e-8`), so MEXC's sub-bp rates are preserved
+/// rather than rounded to `0`. `settleTime` is epoch-ms; the page is re-sorted
+/// ascending (MEXC returns it newest-first).
+///
+/// # Errors
+/// [`MexcError::Parse`] on bad JSON, an unsuccessful payload, a bad rate, or a
+/// timestamp overflow.
+pub fn parse_funding_rate(json: &str) -> Result<Vec<(Timestamp, i64)>, MexcError> {
+    let resp: FuturesFundingResp =
+        serde_json::from_str(json).map_err(|e| MexcError::Parse(e.to_string()))?;
+    if !resp.success {
+        return Err(MexcError::Parse(
+            "contract/funding_rate success=false".into(),
+        ));
+    }
+    let Some(d) = resp.data else {
+        return Ok(Vec::new());
+    };
+    let mut out: Vec<(Timestamp, i64)> = d
+        .result_list
+        .iter()
+        .map(|r| {
+            let ns = r
+                .settle_time
+                .checked_mul(1_000_000)
+                .ok_or_else(|| MexcError::Parse("settleTime overflow".into()))?;
+            Ok((
+                Timestamp::from_nanos(ns),
+                funding_rate_to_raw(&r.funding_rate)?,
+            ))
+        })
+        .collect::<Result<_, MexcError>>()?;
+    out.sort_by_key(|(t, _)| t.as_nanos());
+    Ok(out)
+}
+
+/// Fetch `/api/v1/contract/funding_rate/history` for the contract `symbol` (e.g.
+/// `"BTC_USDT"`) over `transport` (use [`FUTURES_BASE_URL`]) and parse it into a
+/// `with_funding_schedule` schedule (rates at [`FUNDING_RATE_SCALE`]). `limit` caps
+/// the page size (MEXC's cap is 100). A public endpoint — no signing. The reusable
+/// connector entry point — callers never build the URL or touch the body.
+///
+/// # Errors
+/// [`MexcError::Transport`] on a transport failure or a non-2xx status;
+/// [`MexcError::Parse`] on malformed JSON.
+pub fn fetch_funding_history<T: Transport>(
+    transport: &mut T,
+    base_url: &str,
+    symbol: &str,
+    limit: u32,
+) -> Result<Vec<(Timestamp, i64)>, MexcError> {
+    let resp = transport.send(&HttpRequest {
+        method: Method::Get,
+        url: format!(
+            "{base_url}/api/v1/contract/funding_rate/history?symbol={symbol}&page_num=1&page_size={}",
+            limit.min(100)
+        ),
+        api_key: None,
+        body: None,
+    })?;
+    if !resp.is_success() {
+        return Err(MexcError::Transport(format!(
+            "contract/funding_rate HTTP {}",
+            resp.status
+        )));
+    }
+    parse_funding_rate(&resp.body)
+}
+
+/// Page `/api/v1/contract/funding_rate/history` for `symbol` (100 settlements/page,
+/// newest-first) up to `max_pages` and concatenate into one ascending
+/// [`FUNDING_RATE_SCALE`] schedule — one page is ≈33 days at the 8h cadence, so a
+/// multi-page fetch covers a long backtest window. Stops early on an empty page;
+/// de-duplicates by settlement time. A public endpoint — no signing. The reusable
+/// connector entry point — callers never build the URL or touch the body.
+///
+/// # Errors
+/// [`MexcError::Transport`] on a transport failure or a non-2xx status;
+/// [`MexcError::Parse`] on malformed JSON.
+pub fn fetch_funding_history_paged<T: Transport>(
+    transport: &mut T,
+    base_url: &str,
+    symbol: &str,
+    max_pages: u32,
+) -> Result<Vec<(Timestamp, i64)>, MexcError> {
+    let mut all: Vec<(Timestamp, i64)> = Vec::new();
+    for page_num in 1..=max_pages.max(1) {
+        let resp = transport.send(&HttpRequest {
+            method: Method::Get,
+            url: format!(
+                "{base_url}/api/v1/contract/funding_rate/history?symbol={symbol}&page_num={page_num}&page_size=100"
+            ),
+            api_key: None,
+            body: None,
+        })?;
+        if !resp.is_success() {
+            return Err(MexcError::Transport(format!(
+                "contract/funding_rate HTTP {}",
+                resp.status
+            )));
+        }
+        let page = parse_funding_rate(&resp.body)?;
+        if page.is_empty() {
+            break;
+        }
+        all.extend(page);
+    }
+    all.sort_by_key(|(t, _)| t.as_nanos());
+    all.dedup_by_key(|(t, _)| t.as_nanos());
+    Ok(all)
+}
+
+/// Fetch `/api/v1/contract/detail` (public) over `transport` and parse it into the
+/// tradable perpetual contracts ([`parse_contract_detail`]). The reusable connector
+/// entry point — callers never build the URL or touch the body.
+///
+/// # Errors
+/// [`MexcError::Transport`] on a transport failure or a non-2xx status;
+/// [`MexcError::Parse`] on malformed JSON.
+pub fn fetch_contracts<T: Transport>(
+    transport: &mut T,
+    base_url: &str,
+) -> Result<Vec<FuturesContract>, MexcError> {
+    let resp = transport.send(&HttpRequest {
+        method: Method::Get,
+        url: format!("{base_url}/api/v1/contract/detail"),
+        api_key: None,
+        body: None,
+    })?;
+    if !resp.is_success() {
+        return Err(MexcError::Transport(format!(
+            "contract/detail HTTP {}",
+            resp.status
+        )));
+    }
+    parse_contract_detail(&resp.body)
+}
+
 /// A [`DataSource`] streaming MEXC **futures** (perpetual) klines for one symbol —
 /// the futures analogue of [`MexcKlineFeed`](crate::MexcKlineFeed). It targets the
 /// contract `kline` endpoint, reuses the futures interval mapping, and emits
@@ -331,6 +512,12 @@ pub struct MexcFuturesKlineFeed<T> {
     qty_scale: u32,
     start_ms: Option<i64>,
     end_ms: Option<i64>,
+    /// Courtesy delay between back-fill pages (rate-limit politeness) and the unit of
+    /// the bounded 429 back-off. `0` in tests; matters for finer intervals over long
+    /// windows, which take many pages.
+    page_delay: std::time::Duration,
+    /// Bounded retries on a `429` (rate-limited) page before giving up.
+    max_retries: u32,
     buffer: VecDeque<Bar>,
     fetched: bool,
 }
@@ -360,6 +547,8 @@ impl<T: Transport> MexcFuturesKlineFeed<T> {
             qty_scale,
             start_ms: None,
             end_ms: None,
+            page_delay: std::time::Duration::from_millis(120),
+            max_retries: 8,
             buffer: VecDeque::new(),
             fetched: false,
         }
@@ -371,6 +560,16 @@ impl<T: Transport> MexcFuturesKlineFeed<T> {
     pub fn with_range(mut self, start_ms: i64, end_ms: i64) -> Self {
         self.start_ms = Some(start_ms);
         self.end_ms = Some(end_ms);
+        self
+    }
+
+    /// Override the inter-page courtesy delay (default 120 ms), which also sets the
+    /// 429 back-off unit. Set to [`Duration::ZERO`](std::time::Duration::ZERO) in
+    /// tests to page without sleeping. Lower it / raise it to trade download speed
+    /// against the venue's rate limit on long, fine-interval back-fills.
+    #[must_use]
+    pub fn with_page_delay(mut self, delay: std::time::Duration) -> Self {
+        self.page_delay = delay;
         self
     }
 
@@ -396,45 +595,89 @@ impl<T: Transport> MexcFuturesKlineFeed<T> {
         if let Some(e) = end_s {
             let _ = write!(url, "&end={e}");
         }
-        let req = HttpRequest {
-            method: Method::Get,
-            url,
-            api_key: None,
-            body: None,
+        // Bounded 429 back-off (a zero `page_delay`, i.e. tests, means zero back-off
+        // and an immediate retry); other non-2xx statuses surface as an error.
+        let backoff = if self.page_delay.is_zero() {
+            std::time::Duration::ZERO
+        } else {
+            std::time::Duration::from_secs(2)
         };
-        let resp = self.transport.send(&req)?;
-        if !resp.is_success() {
-            return Err(MexcError::Transport(format!(
-                "contract/kline HTTP {}",
-                resp.status
-            )));
+        let mut retries = 0u32;
+        loop {
+            let req = HttpRequest {
+                method: Method::Get,
+                url: url.clone(),
+                api_key: None,
+                body: None,
+            };
+            let resp = self.transport.send(&req)?;
+            if resp.status == 429 && retries < self.max_retries {
+                retries += 1;
+                if !backoff.is_zero() {
+                    std::thread::sleep(backoff);
+                }
+                continue;
+            }
+            if !resp.is_success() {
+                return Err(MexcError::Transport(format!(
+                    "contract/kline HTTP {}",
+                    resp.status
+                )));
+            }
+            return parse_futures_klines(
+                &resp.body,
+                self.instrument,
+                self.price_scale,
+                self.qty_scale,
+            );
         }
-        parse_futures_klines(
-            &resp.body,
-            self.instrument,
-            self.price_scale,
-            self.qty_scale,
-        )
     }
 
+    /// Back-fill `[start_ms, end_ms)` by paging the contract-kline endpoint
+    /// **newest→oldest**. MEXC caps each response at ~2000 bars anchored on `end` and
+    /// **ignores `start`** once the range exceeds that cap, so a forward cursor never
+    /// advances; instead we move the `end` cursor back to just before the oldest bar
+    /// received and repeat until a page reaches `start`. Bars are close-stamped; the
+    /// result is sorted ascending, de-duplicated, and clipped to `[start, end)` on
+    /// open time.
     fn backfill(&mut self, start_ms: i64, end_ms: i64) -> Result<Vec<Bar>, MexcError> {
         let bar_secs = futures_interval_secs(&self.interval).max(1);
-        let end_secs = end_ms / 1000;
-        let mut cursor_secs = start_ms / 1000;
+        let start_secs = start_ms / 1000;
+        let mut cursor_end = end_ms / 1000;
         let mut all: Vec<Bar> = Vec::new();
-        while cursor_secs < end_secs {
-            let page = self.fetch_page(Some(cursor_secs), Some(end_secs))?;
+        loop {
+            let page = self.fetch_page(Some(start_secs), Some(cursor_end))?;
             if page.is_empty() {
                 break;
             }
-            let last_secs = page.last().expect("non-empty").ts.as_nanos() / 1_000_000_000;
+            // `ts` is close time; open = close - interval. The oldest open seen drives
+            // the next (earlier) `end` cursor.
+            let oldest_close_secs = page
+                .iter()
+                .map(|b| b.ts.as_nanos() / 1_000_000_000)
+                .min()
+                .expect("non-empty");
+            let oldest_open_secs = oldest_close_secs - bar_secs;
             all.extend(page);
-            let next = last_secs + bar_secs;
-            if next <= cursor_secs {
-                break; // no forward progress
+            if oldest_open_secs <= start_secs {
+                break;
             }
-            cursor_secs = next;
+            let next_end = oldest_open_secs - bar_secs;
+            if next_end >= cursor_end {
+                break; // no backward progress (guards a venue that ignores the cursor)
+            }
+            cursor_end = next_end;
+            if !self.page_delay.is_zero() {
+                std::thread::sleep(self.page_delay); // pace long, fine-interval back-fills
+            }
         }
+        all.sort_by_key(|b| b.ts.as_nanos());
+        all.dedup_by_key(|b| b.ts.as_nanos());
+        let bar_ms = bar_secs * 1000;
+        all.retain(|b| {
+            let open_ms = b.ts.as_nanos() / 1_000_000 - bar_ms;
+            open_ms >= start_ms && open_ms < end_ms
+        });
         Ok(all)
     }
 
@@ -615,6 +858,21 @@ mod feed_tests {
         }
     }
 
+    /// Build a columnar contract-kline body (flat OHLC=100, vol=1) for the given
+    /// **open** seconds — a test page for the backward-paging back-fill.
+    fn fut_cols(opens: &[i64]) -> String {
+        let times = opens
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let ones = vec!["100"; opens.len()].join(",");
+        let vols = vec!["1"; opens.len()].join(",");
+        format!(
+            r#"{{"success":true,"data":{{"time":[{times}],"open":[{ones}],"high":[{ones}],"low":[{ones}],"close":[{ones}],"vol":[{vols}]}}}}"#
+        )
+    }
+
     #[test]
     fn interval_token_mapping() {
         assert_eq!(futures_interval("1m"), Some("Min1"));
@@ -660,6 +918,99 @@ mod feed_tests {
     }
 
     #[test]
+    fn funding_rate_parses_numbers_to_fine_scale_sorted() {
+        // The contract API returns fundingRate as a JSON NUMBER, settleTime as ms.
+        // Newest-first; re-sorted ascending.
+        let json = r#"{"success":true,"data":{"resultList":[
+            {"symbol":"BTC_USDT","fundingRate":0.0001,"settleTime":1700028800000,"collectCycle":8},
+            {"symbol":"BTC_USDT","fundingRate":-0.0000466,"settleTime":1700000000000,"collectCycle":8}
+        ]}}"#;
+        let sched = parse_funding_rate(json).unwrap();
+        assert_eq!(sched.len(), 2);
+        // At FUNDING_RATE_SCALE (1e-8): 0.0001 → 10_000 (= 1 bp); the sub-bp number
+        // -0.0000466 → -4_660, not rounded to 0 (and not mangled into 1e-N text).
+        assert_eq!(
+            sched[0],
+            (Timestamp::from_nanos(1_700_000_000_000_000_000), -4_660)
+        );
+        assert_eq!(
+            sched[1],
+            (Timestamp::from_nanos(1_700_028_800_000_000_000), 10_000)
+        );
+        // A string rate is also accepted; success=false errors; no data → empty.
+        let str_rate = r#"{"success":true,"data":{"resultList":[
+            {"symbol":"BTC_USDT","fundingRate":"0.0001","settleTime":1700000000000}]}}"#;
+        assert_eq!(parse_funding_rate(str_rate).unwrap()[0].1, 10_000);
+        assert!(parse_funding_rate(r#"{"success":false}"#).is_err());
+        assert!(
+            parse_funding_rate(r#"{"success":true}"#)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(parse_funding_rate("not json").is_err());
+    }
+
+    #[test]
+    fn fetch_funding_history_builds_public_contract_url() {
+        use crate::transport::MockTransport;
+        let body = r#"{"success":true,"data":{"resultList":[
+            {"symbol":"BTC_USDT","fundingRate":0.0001,"settleTime":1700000000000}]}}"#;
+        let mut t = MockTransport::new(vec![HttpResponse::ok(body)]);
+        let sched = fetch_funding_history(&mut t, FUTURES_BASE_URL, "BTC_USDT", 100).unwrap();
+        assert_eq!(sched.len(), 1);
+        assert!(
+            t.sent[0]
+                .url
+                .contains("/api/v1/contract/funding_rate/history?symbol=BTC_USDT")
+        );
+        assert!(t.sent[0].api_key.is_none()); // public endpoint — unsigned
+        let mut bad = MockTransport::new(vec![HttpResponse::error(500, "")]);
+        assert!(fetch_funding_history(&mut bad, FUTURES_BASE_URL, "BTC_USDT", 100).is_err());
+    }
+
+    #[test]
+    fn fetch_funding_history_paged_concatenates_until_empty() {
+        use crate::transport::MockTransport;
+        let page1 = r#"{"success":true,"data":{"resultList":[
+            {"symbol":"BTC_USDT","fundingRate":0.0001,"settleTime":1700028800000},
+            {"symbol":"BTC_USDT","fundingRate":-0.0000466,"settleTime":1700000000000}]}}"#;
+        let empty = r#"{"success":true,"data":{"resultList":[]}}"#;
+        let mut t = MockTransport::new(vec![HttpResponse::ok(page1), HttpResponse::ok(empty)]);
+        let sched = fetch_funding_history_paged(&mut t, FUTURES_BASE_URL, "BTC_USDT", 5).unwrap();
+        assert_eq!(sched.len(), 2); // page 1's two rows; empty page 2 stops paging
+        assert_eq!(t.sent.len(), 2);
+        assert!(t.sent[0].url.contains("page_num=1&page_size=100"));
+        assert!(t.sent[1].url.contains("page_num=2"));
+        // Concatenated + ascending: -0.0000466 → -4_660 (older), 0.0001 → 10_000 (newer).
+        assert_eq!(
+            sched[0],
+            (Timestamp::from_nanos(1_700_000_000_000_000_000), -4_660)
+        );
+        assert_eq!(
+            sched[1],
+            (Timestamp::from_nanos(1_700_028_800_000_000_000), 10_000)
+        );
+        let mut bad = MockTransport::new(vec![HttpResponse::error(500, "")]);
+        assert!(fetch_funding_history_paged(&mut bad, FUTURES_BASE_URL, "X", 5).is_err());
+    }
+
+    #[test]
+    fn fetch_contracts_builds_public_detail_url() {
+        use crate::transport::MockTransport;
+        let body = r#"{"success":true,"data":[
+            {"symbol":"BTC_USDT","baseCoin":"BTC","quoteCoin":"USDT","priceScale":2,"volScale":0,
+             "priceUnit":0.10,"volUnit":1,"state":0,"apiAllowed":true}]}"#;
+        let mut t = MockTransport::new(vec![HttpResponse::ok(body)]);
+        let contracts = fetch_contracts(&mut t, FUTURES_BASE_URL).unwrap();
+        assert_eq!(contracts.len(), 1);
+        assert_eq!(contracts[0].symbol, "BTC_USDT");
+        assert!(t.sent[0].url.ends_with("/api/v1/contract/detail"));
+        assert!(t.sent[0].api_key.is_none());
+        let mut bad = MockTransport::new(vec![HttpResponse::error(500, "")]);
+        assert!(fetch_contracts(&mut bad, FUTURES_BASE_URL).is_err());
+    }
+
+    #[test]
     fn feed_streams_bars_no_range() {
         let mut feed = MexcFuturesKlineFeed::new(
             Canned(vec![KLINES.to_string()]),
@@ -687,12 +1038,79 @@ mod feed_tests {
             2,
             0,
         )
-        .with_range(1_700_000_000_000, 1_700_000_200_000);
+        .with_range(1_700_000_000_000, 1_700_000_200_000)
+        .with_page_delay(std::time::Duration::ZERO);
         let mut n = 0;
         while feed.next_event().is_some() {
             n += 1;
         }
-        assert_eq!(n, 2); // page 1 yields 2 bars; the empty page 2 terminates backfill
+        assert_eq!(n, 2); // page 1 reaches `start` (oldest open == start) → backfill stops
+    }
+
+    /// Regression: MEXC caps a contract-kline response at ~2000 bars anchored on
+    /// `end` and ignores `start` for long ranges, so the back-fill must page
+    /// newest→oldest by moving the `end` cursor back — not by advancing `start`
+    /// (which re-fetched the same recent window forever, the bug that capped a
+    /// year-long request at one page).
+    #[test]
+    fn feed_pages_backward_by_end_cursor() {
+        use crate::transport::MockTransport;
+        // Two 5-bar pages of 1m bars spanning [1700000000, 1700000540] (opens).
+        let recent = fut_cols(&[
+            1_700_000_300,
+            1_700_000_360,
+            1_700_000_420,
+            1_700_000_480,
+            1_700_000_540,
+        ]);
+        let older = fut_cols(&[
+            1_700_000_000,
+            1_700_000_060,
+            1_700_000_120,
+            1_700_000_180,
+            1_700_000_240,
+        ]);
+        let mut feed = MexcFuturesKlineFeed::new(
+            MockTransport::new(vec![HttpResponse::ok(recent), HttpResponse::ok(older)]),
+            "http://x",
+            "BTC_USDT",
+            InstrumentId::new(0),
+            "1m",
+            0,
+            0,
+        )
+        .with_range(1_700_000_000_000, 1_700_000_600_000)
+        .with_page_delay(std::time::Duration::ZERO);
+        let mut n = 0;
+        while feed.next_event().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 10); // BOTH pages collected, not just the recent 5
+        // The `end` cursor moved BACKWARD between requests (newest→oldest paging).
+        assert!(feed.transport.sent[0].url.contains("end=1700000600"));
+        assert!(feed.transport.sent[1].url.contains("end=1700000240"));
+    }
+
+    #[test]
+    fn feed_retries_on_429_then_yields() {
+        use crate::transport::MockTransport;
+        // A leading 429 must be retried (zero back-off at page_delay 0), not fatal.
+        let mut feed = MexcFuturesKlineFeed::new(
+            MockTransport::new(vec![
+                HttpResponse::error(429, ""),
+                HttpResponse::ok(fut_cols(&[1_700_000_000])),
+            ]),
+            "http://x",
+            "BTC_USDT",
+            InstrumentId::new(0),
+            "1m",
+            0,
+            0,
+        )
+        .with_page_delay(std::time::Duration::ZERO);
+        // No range → single recent fetch; the 429 is retried, then the bar is yielded.
+        assert!(feed.next_event().is_some());
+        assert!(feed.next_event().is_none());
     }
 
     #[test]
@@ -707,5 +1125,81 @@ mod feed_tests {
             0,
         );
         assert!(feed.next_event().is_none()); // fetch errors → None
+    }
+
+    fn mexc_range_feed(
+        bodies: Vec<crate::transport::HttpResponse>,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> MexcFuturesKlineFeed<crate::transport::MockTransport> {
+        MexcFuturesKlineFeed::new(
+            crate::transport::MockTransport::new(bodies),
+            "http://x",
+            "BTC_USDT",
+            InstrumentId::new(0),
+            "1m",
+            0,
+            0,
+        )
+        .with_range(start_ms, end_ms)
+        .with_page_delay(std::time::Duration::ZERO)
+    }
+
+    #[test]
+    fn feed_guards_against_no_progress() {
+        // Same page twice: the `end` cursor can't move back → terminate, not hang.
+        let p = || HttpResponse::ok(fut_cols(&[1_700_000_300, 1_700_000_360]));
+        let mut feed = mexc_range_feed(vec![p(), p()], 1_700_000_000_000, 1_700_000_600_000);
+        let mut n = 0;
+        while feed.next_event().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 2); // de-duplicated; guard stopped the stall
+    }
+
+    #[test]
+    fn feed_clips_window_and_dedups() {
+        // open seconds; start = 1_700_000_060 s. The 1_700_000_000 bar is clipped;
+        // the 1_700_000_060 duplicate collapses.
+        let page = fut_cols(&[1_700_000_000, 1_700_000_060, 1_700_000_060, 1_700_000_120]);
+        let mut feed = mexc_range_feed(
+            vec![HttpResponse::ok(page)],
+            1_700_000_060_000,
+            1_700_000_600_000,
+        );
+        let mut n = 0;
+        while feed.next_event().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 2); // 60 & 120; 0 clipped, dup collapsed
+    }
+
+    #[test]
+    fn feed_empty_page_terminates_backfill() {
+        // Page 1 has oldest open > start (would page again); the empty page 2 stops it.
+        let empty = r#"{"success":true,"data":{"time":[],"open":[],"high":[],"low":[],"close":[],"vol":[]}}"#;
+        let mut feed = mexc_range_feed(
+            vec![
+                HttpResponse::ok(fut_cols(&[1_700_000_300, 1_700_000_360])),
+                HttpResponse::ok(empty.to_string()),
+            ],
+            1_700_000_000_000,
+            1_700_000_600_000,
+        );
+        let mut n = 0;
+        while feed.next_event().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 2); // page 1 kept; empty page 2 ended the backfill
+    }
+
+    #[test]
+    fn feed_429_exhausted_yields_none() {
+        let mut feed = mexc_range_feed(
+            (0..10).map(|_| HttpResponse::error(429, "")).collect(),
+            1_700_000_000_000,
+            1_700_000_060_000,
+        );
+        assert!(feed.next_event().is_none());
     }
 }

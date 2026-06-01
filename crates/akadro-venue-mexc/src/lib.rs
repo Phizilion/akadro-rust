@@ -45,8 +45,9 @@ pub use client::{MAX_KLINES_LIMIT, MexcKlineFeed, MexcSpotExec};
 pub use convert::{decimal_to_raw, raw_to_decimal};
 pub use error::{MexcError, map_reject_code};
 pub use futures::{
-    FUTURES_BASE_URL, FuturesContract, MexcFuturesKlineFeed, futures_interval, futures_side,
-    futures_type, parse_contract_detail, parse_futures_klines, sign_futures,
+    FUNDING_RATE_SCALE, FUTURES_BASE_URL, FuturesContract, MexcFuturesKlineFeed, fetch_contracts,
+    fetch_funding_history, fetch_funding_history_paged, futures_interval, futures_side,
+    futures_type, parse_contract_detail, parse_funding_rate, parse_futures_klines, sign_futures,
 };
 pub use instrument::MexcCatalog;
 pub use parse::{

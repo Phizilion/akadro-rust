@@ -24,8 +24,8 @@
 use core::fmt;
 
 use akadro_core::{
-    AccountEvent, AkadroError, DataSource, Event, ExecutionClient, InstrumentId, InstrumentSpec,
-    Money, Result, Timestamp,
+    AccountEvent, AkadroError, DataSource, Event, ExecutionClient, InstrumentSpec, Money, Result,
+    Timestamp,
 };
 
 use crate::context::{Ctx, GateAction, OrderGate};
@@ -204,7 +204,6 @@ impl<S: Strategy, D: DataSource, X: ExecutionClient> Engine<S, D, X> {
             mut sink,
             instruments,
         } = self;
-        let n_instruments = instruments.len();
 
         let mut now = Timestamp::EPOCH;
         let mut bars_processed: u64 = 0;
@@ -290,7 +289,7 @@ impl<S: Strategy, D: DataSource, X: ExecutionClient> Engine<S, D, X> {
                     now,
                 );
                 // (5) record mark-to-market equity at this bar close.
-                let eq = mark_to_market(&market, &portfolio, n_instruments);
+                let eq = mark_to_market(&market, &portfolio);
                 equity_curve.push(EquityPoint {
                     ts: now,
                     equity: eq,
@@ -446,11 +445,14 @@ fn invalid_data(e: serde_json::Error) -> std::io::Error {
 /// the curve). A `debug_assert` surfaces the violation; all shipping clients
 /// (`SimulatedExchange`, the DEX and MEXC connectors) honour it by only filling
 /// against the bar they are observing.
-fn mark_to_market(market: &Market, portfolio: &Portfolio, n_instruments: usize) -> Money {
+fn mark_to_market(market: &Market, portfolio: &Portfolio) -> Money {
     let view = MarketView::new(market);
     let mut equity = portfolio.cash();
-    for i in 0..n_instruments {
-        let inst = InstrumentId::new(i as u32);
+    // Sum unrealized value over only the OPEN positions — O(open), not O(catalog).
+    // Scanning every instrument each bar made a few-instrument strategy on a large
+    // venue catalogue (e.g. ~1200 OKX spot pairs) pay ~catalog-size cost per bar.
+    // A flat position contributes 0, so this is bit-identical to the full scan.
+    for &inst in portfolio.open_positions() {
         let qty = portfolio.net_qty(inst).raw();
         if qty != 0 {
             if let Some(mark) = view.closes(inst).and_then(|s| s.latest()) {
@@ -459,8 +461,9 @@ fn mark_to_market(market: &Market, portfolio: &Portfolio, n_instruments: usize) 
             } else {
                 debug_assert!(
                     false,
-                    "instrument {i} holds a non-zero position but has no observed bar \
-                     (an ExecutionClient emitted a fill before the instrument's first bar)"
+                    "instrument {} holds a non-zero position but has no observed bar \
+                     (an ExecutionClient emitted a fill before the instrument's first bar)",
+                    inst.index()
                 );
             }
         }

@@ -282,9 +282,11 @@ pub enum AccountEvent {
         instrument: InstrumentId,
         /// The signed funding cost.
         cost: Cost,
-        /// The funding rate applied, in signed basis points (positive = longs pay
-        /// shorts; same unit as the venue/config funding rate), so a strategy can
-        /// observe or reconstruct the effective rate without back-solving `cost`.
+        /// The funding rate applied, signed (positive = longs pay shorts) at
+        /// [`FUNDING_RATE_SCALE`](crate::FUNDING_RATE_SCALE) — i.e. `rate · 10⁻⁸`, so
+        /// `10_000` is one basis point — the same fine-grained unit the venue
+        /// connectors and the engine's `mul_rate` charge use. A strategy can observe
+        /// or reconstruct the effective rate without back-solving `cost`.
         rate: i64,
         /// When (event time).
         ts: Timestamp,

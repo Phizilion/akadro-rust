@@ -31,10 +31,12 @@ use crate::{BinanceError, HttpRequest, Method, Transport, decimal_to_raw};
 /// Base URL for the USDⓈ-M futures API.
 pub const FUTURES_BASE_URL: &str = "https://fapi.binance.com";
 
-/// The funding-rate decimal is normalized to **basis points** (scale 4): Binance
-/// reports `"0.00010000"` for one funding period, i.e. 0.01% = 1 bp, which is the
-/// granularity the engine's funding model charges (`amount = notional·rate/10000`).
-pub const FUNDING_RATE_SCALE: u32 = 4;
+/// Funding-rate fixed-point scale — re-exported from `akadro-core` so the connector
+/// and the engine's `mul_rate` charge cannot drift. Binance reports `fundingRate`
+/// with exactly 8 decimals (`"0.00010000"` = 0.01% = 1 bp), so the `1e-8` scale is
+/// **lossless** here: `"0.00010000"` → `10_000`, and a sub-bp `"0.00000466"` →
+/// `466` rather than rounding to `0` as a basis-point scale would.
+pub use akadro_core::FUNDING_RATE_SCALE;
 
 /// The long/short account ratio is normalized to `ratio × 10_000` (scale 4):
 /// Binance's `"1.8105"` → `18_105`. Strategies divide by `10_000` to recover it.
@@ -61,9 +63,10 @@ struct FundingRow {
     funding_rate: String,
 }
 
-/// Parse `/fapi/v1/fundingRate` history into a `(timestamp, rate_bps)` schedule
-/// for `SimulatedExchange::with_funding_schedule` (in `akadro-backtest`). Rates
-/// are normalized to bps ([`FUNDING_RATE_SCALE`]).
+/// Parse `/fapi/v1/fundingRate` history into a `(timestamp, rate)` schedule for
+/// `SimulatedExchange::with_funding_schedule` (in `akadro-backtest`). Rates are
+/// normalized to [`FUNDING_RATE_SCALE`] (`1e-8`), which is lossless for Binance's
+/// 8-decimal `fundingRate` and preserves sub-bp rates instead of rounding them away.
 ///
 /// # Errors
 /// [`BinanceError::Parse`] on bad JSON, a bad rate, or a timestamp overflow.
@@ -78,6 +81,94 @@ pub fn parse_funding_rate(json: &str) -> Result<Vec<(Timestamp, i64)>, BinanceEr
             ))
         })
         .collect()
+}
+
+/// Fetch `/fapi/v1/fundingRate` for `symbol` over `transport` (pass
+/// [`FUTURES_BASE_URL`]) and parse it into a `with_funding_schedule` schedule (rates
+/// at [`FUNDING_RATE_SCALE`]). `limit` caps the settlements returned (Binance's cap is
+/// 1000). A public endpoint — no signing. The reusable connector entry point —
+/// callers never build the URL or touch the body.
+///
+/// # Errors
+/// [`BinanceError::Transport`] on a transport failure or a non-2xx status;
+/// [`BinanceError::Parse`] on malformed JSON.
+pub fn fetch_funding_history<T: Transport>(
+    transport: &mut T,
+    base_url: &str,
+    symbol: &str,
+    limit: u32,
+) -> Result<Vec<(Timestamp, i64)>, BinanceError> {
+    let resp = transport.send(&HttpRequest {
+        method: Method::Get,
+        url: format!(
+            "{base_url}/fapi/v1/fundingRate?symbol={symbol}&limit={}",
+            limit.min(1000)
+        ),
+        api_key: None,
+    })?;
+    if !resp.is_success() {
+        return Err(BinanceError::Transport(format!(
+            "fundingRate HTTP {}",
+            resp.status
+        )));
+    }
+    parse_funding_rate(&resp.body)
+}
+
+/// Page `/fapi/v1/fundingRate` **forward** over `[start_ms, end_ms]` into one
+/// ascending [`FUNDING_RATE_SCALE`] schedule. Binance returns settlements ascending
+/// from `startTime` (1000/page ≈ 333 days at the 8h cadence), so each page advances
+/// `startTime` past the newest settlement seen; a short page (< 1000) or one reaching
+/// `end_ms` ends it. De-duplicates by time. The reusable connector entry point.
+///
+/// # Errors
+/// [`BinanceError::Transport`] on a transport failure or a non-2xx status;
+/// [`BinanceError::Parse`] on malformed JSON.
+pub fn fetch_funding_history_paged<T: Transport>(
+    transport: &mut T,
+    base_url: &str,
+    symbol: &str,
+    start_ms: i64,
+    end_ms: i64,
+    max_pages: u32,
+) -> Result<Vec<(Timestamp, i64)>, BinanceError> {
+    let mut all: Vec<(Timestamp, i64)> = Vec::new();
+    let mut cursor = start_ms;
+    for _ in 0..max_pages.max(1) {
+        let resp = transport.send(&HttpRequest {
+            method: Method::Get,
+            url: format!(
+                "{base_url}/fapi/v1/fundingRate?symbol={symbol}&startTime={cursor}&endTime={end_ms}&limit=1000"
+            ),
+            api_key: None,
+        })?;
+        if !resp.is_success() {
+            return Err(BinanceError::Transport(format!(
+                "fundingRate HTTP {}",
+                resp.status
+            )));
+        }
+        let page = parse_funding_rate(&resp.body)?; // ascending
+        let n = page.len();
+        let newest_ms = page.last().map(|(t, _)| t.as_nanos() / 1_000_000);
+        all.extend(page);
+        let Some(newest_ms) = newest_ms else { break };
+        if n < 1000 || newest_ms >= end_ms {
+            break; // short page (or reached the window end) → done
+        }
+        let next = newest_ms + 1;
+        if next <= cursor {
+            break; // no forward progress
+        }
+        cursor = next;
+    }
+    all.sort_by_key(|(t, _)| t.as_nanos());
+    all.dedup_by_key(|(t, _)| t.as_nanos());
+    all.retain(|(t, _)| {
+        let ms = t.as_nanos() / 1_000_000;
+        ms >= start_ms && ms <= end_ms
+    });
+    Ok(all)
 }
 
 #[derive(Deserialize)]
@@ -286,18 +377,20 @@ mod tests {
     }
 
     #[test]
-    fn funding_rate_normalizes_to_bps() {
+    fn funding_rate_normalizes_to_fine_scale() {
         let json = r#"[
             {"symbol":"BTCUSDT","fundingTime":1700000000000,"fundingRate":"0.00010000"},
             {"symbol":"BTCUSDT","fundingTime":1700028800000,"fundingRate":"-0.00005000"}
         ]"#;
         let sched = parse_funding_rate(json).unwrap();
         assert_eq!(sched.len(), 2);
+        // At FUNDING_RATE_SCALE (1e-8), Binance's 8-decimal rate is lossless:
+        // 0.00010000 → 10_000 (= 1 bp); the sub-bp -0.00005000 → -5_000 (was 0 at bps).
         assert_eq!(
             sched[0],
-            (Timestamp::from_nanos(1_700_000_000_000_000_000), 1)
-        ); // 1 bp
-        assert_eq!(sched[1].1, 0); // -0.00005 truncates to 0 at bp granularity
+            (Timestamp::from_nanos(1_700_000_000_000_000_000), 10_000)
+        );
+        assert_eq!(sched[1].1, -5_000);
     }
 
     #[test]
@@ -400,5 +493,80 @@ mod tests {
         assert!(parse_funding_rate("not json").is_err());
         assert!(parse_open_interest("not json").is_err());
         assert!(parse_long_short_ratio("not json").is_err());
+    }
+
+    #[test]
+    fn fetch_funding_history_builds_url() {
+        let body =
+            r#"[{"symbol":"BTCUSDT","fundingTime":1700000000000,"fundingRate":"0.00010000"}]"#;
+        let mut t = MockTransport::new(vec![HttpResponse {
+            status: 200,
+            body: body.into(),
+        }]);
+        let sched = fetch_funding_history(&mut t, FUTURES_BASE_URL, "BTCUSDT", 1000).unwrap();
+        assert_eq!(
+            sched,
+            vec![(Timestamp::from_nanos(1_700_000_000_000_000_000), 10_000)]
+        );
+        assert!(
+            t.sent[0]
+                .url
+                .contains("/fapi/v1/fundingRate?symbol=BTCUSDT")
+        );
+        assert!(t.sent[0].api_key.is_none()); // public — unsigned
+        let mut bad = MockTransport::new(vec![HttpResponse {
+            status: 500,
+            body: String::new(),
+        }]);
+        assert!(fetch_funding_history(&mut bad, FUTURES_BASE_URL, "BTCUSDT", 1000).is_err());
+    }
+
+    #[test]
+    fn funding_history_paged_walks_forward() {
+        // A full 1000-row first page forces a second (forward) request; the short
+        // second page ends it. Verifies startTime advances past the newest seen.
+        let period = 28_800_000i64; // 8h
+        let start = 1_700_000_000_000i64;
+        let rows: String = (0..1000)
+            .map(|i| {
+                format!(
+                    r#"{{"symbol":"BTCUSDT","fundingTime":{},"fundingRate":"0.00010000"}}"#,
+                    start + i * period
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let page1 = format!("[{rows}]");
+        let newest1 = start + 999 * period;
+        let page2 = format!(
+            r#"[{{"symbol":"BTCUSDT","fundingTime":{},"fundingRate":"0.00020000"}}]"#,
+            newest1 + period
+        );
+        let end = newest1 + 2 * period;
+        let mut t = MockTransport::new(vec![
+            HttpResponse {
+                status: 200,
+                body: page1,
+            },
+            HttpResponse {
+                status: 200,
+                body: page2,
+            },
+        ]);
+        let sched =
+            fetch_funding_history_paged(&mut t, FUTURES_BASE_URL, "BTCUSDT", start, end, 10)
+                .unwrap();
+        assert_eq!(sched.len(), 1001); // both pages, de-duplicated
+        assert!(t.sent[0].url.contains(&format!("startTime={start}")));
+        assert!(
+            t.sent[1]
+                .url
+                .contains(&format!("startTime={}", newest1 + 1))
+        ); // advanced
+        let mut bad = MockTransport::new(vec![HttpResponse {
+            status: 500,
+            body: String::new(),
+        }]);
+        assert!(fetch_funding_history_paged(&mut bad, FUTURES_BASE_URL, "X", 0, 1, 10).is_err());
     }
 }

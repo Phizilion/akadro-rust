@@ -40,4 +40,5 @@ flamegraph.svg
 # should never exist in-tree.
 /rust_out
 /librust_out.rlib
+/verify_overflow
 
