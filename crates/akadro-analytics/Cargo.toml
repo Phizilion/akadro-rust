@@ -13,5 +13,14 @@ categories.workspace = true
 akadro-core.workspace = true
 akadro-engine.workspace = true
 
+[features]
+# Off by default. Exposes the low-level generic walk-forward fold runners
+# (`run_walk_forward` / `run_walk_forward_checked`) that hand a closure BOTH the
+# train AND the out-of-sample test slice — an IS/OOS-leakage footgun the type system
+# cannot police. The default surface offers only the structurally-safe
+# `WalkForwardBacktest` (fit-on-train-only) + `slice_window` for explicit custom
+# orchestration. Opt in only if you knowingly need the generic form.
+escape-hatch = []
+
 [lints]
 workspace = true

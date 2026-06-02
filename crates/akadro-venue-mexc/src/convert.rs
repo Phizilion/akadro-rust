@@ -13,7 +13,9 @@
 use crate::error::MexcError;
 
 /// Parse a decimal string into a fixed-point raw integer at `scale` decimal
-/// places. Excess fractional digits are truncated toward zero.
+/// places. Excess fractional digits are truncated toward zero. Thin adapter over
+/// the venue-neutral [`akadro_core::decimal_to_raw`] (which this crate's parser was
+/// the model for — DRY), mapping a rejected value to [`MexcError`].
 ///
 /// ```
 /// use akadro_venue_mexc::decimal_to_raw;
@@ -23,62 +25,18 @@ use crate::error::MexcError;
 /// assert_eq!(decimal_to_raw("0.000001", 6).unwrap(), 1);
 /// assert_eq!(decimal_to_raw("-5", 0).unwrap(), -5);
 /// ```
+///
+/// # Errors
+/// [`MexcError::Parse`] if `s` is empty, non-numeric, or overflows `i64` at `scale`.
 pub fn decimal_to_raw(s: &str, scale: u32) -> Result<i64, MexcError> {
-    let s = s.trim();
-    let (neg, body) = match s.strip_prefix('-') {
-        Some(b) => (true, b),
-        None => (false, s.strip_prefix('+').unwrap_or(s)),
-    };
-    let (int_part, frac_part) = body.split_once('.').unwrap_or((body, ""));
-    if int_part.is_empty() && frac_part.is_empty() {
-        return Err(MexcError::Parse(format!("empty decimal: {s:?}")));
-    }
-    if !int_part.bytes().all(|b| b.is_ascii_digit())
-        || !frac_part.bytes().all(|b| b.is_ascii_digit())
-    {
-        return Err(MexcError::Parse(format!("invalid decimal: {s:?}")));
-    }
-
-    let scale = scale as usize;
-    // Keep at most `scale` fractional digits (truncate), then left-pad the value
-    // so it occupies exactly `scale` places.
-    let frac_kept = if frac_part.len() >= scale {
-        &frac_part[..scale]
-    } else {
-        frac_part
-    };
-    let pad = scale - frac_kept.len();
-
-    let parse = |t: &str| -> Result<i128, MexcError> {
-        if t.is_empty() {
-            Ok(0)
-        } else {
-            t.parse::<i128>()
-                .map_err(|_| MexcError::Parse(format!("overflow: {s:?}")))
-        }
-    };
-    let int_v = parse(int_part)?;
-    let frac_v = parse(frac_kept)?;
-
-    let pow = |p: usize| {
-        10i128
-            .checked_pow(p as u32)
-            .ok_or_else(|| MexcError::Parse("scale too large".into()))
-    };
-    let scale_pow = pow(scale)?;
-    let pad_pow = pow(pad)?;
-    let raw = int_v
-        .checked_mul(scale_pow)
-        .and_then(|x| x.checked_add(frac_v.checked_mul(pad_pow)?))
-        .ok_or_else(|| MexcError::Parse(format!("overflow scaling {s:?}")))?;
-    let raw = if neg { -raw } else { raw };
-
-    i64::try_from(raw)
-        .map_err(|_| MexcError::Parse(format!("{s:?} overflows i64 at scale {scale}")))
+    akadro_core::decimal_to_raw(s, scale)
+        .ok_or_else(|| MexcError::Parse(format!("bad decimal {s:?} at scale {scale}")))
 }
 
 /// Render a fixed-point raw integer at `scale` decimal places as a decimal
-/// string (for request bodies and logs).
+/// string (for request bodies and logs). Unlike [`akadro_core::raw_to_decimal`],
+/// this **pads to exactly `scale` places** (no trailing-zero trim), preserving the
+/// precise byte form MEXC order params are tested/signed against.
 ///
 /// ```
 /// use akadro_venue_mexc::raw_to_decimal;

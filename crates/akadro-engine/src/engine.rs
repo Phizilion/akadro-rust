@@ -253,19 +253,27 @@ impl<S: Strategy, D: DataSource, X: ExecutionClient> Engine<S, D, X> {
             // unknown future variants simply fall through and are ignored.
             if let Event::Bar(bar) = &event {
                 let bar = *bar;
+                // A bar for an instrument outside the catalog is silently dropped by
+                // `Market::push` (documented contract); surface that feed/catalog
+                // mismatch in debug so a mis-wired source doesn't vanish quietly (m20).
+                debug_assert!(
+                    (bar.instrument.index() as usize) < instruments.len(),
+                    "feed emitted a bar for instrument {} outside the {}-instrument \
+                     catalog — it will be silently ignored",
+                    bar.instrument.index(),
+                    instruments.len()
+                );
                 market.push(&bar); // (3) state now includes this bar
                 // Fire any event-time timers now due, before on_bar (their orders
                 // are routed together with on_bar's below).
-                for at in gate.drain_due_timers(now) {
-                    let mut ctx = Ctx::new(
-                        MarketView::new(&market),
-                        &mut gate,
-                        &portfolio,
-                        &instruments,
-                        now,
-                    );
-                    strategy.on_timer(at, &mut ctx);
-                }
+                fire_due_timers(
+                    &mut strategy,
+                    &market,
+                    &mut gate,
+                    &portfolio,
+                    &instruments,
+                    now,
+                );
                 {
                     let mut ctx = Ctx::new(
                         MarketView::new(&market),
@@ -304,6 +312,16 @@ impl<S: Strategy, D: DataSource, X: ExecutionClient> Engine<S, D, X> {
                     ts: *ts,
                 };
                 portfolio.apply(&ae);
+                // Timers due at this resync's time fire before on_account, batched
+                // with on_account's orders below (m19/m21).
+                fire_due_timers(
+                    &mut strategy,
+                    &market,
+                    &mut gate,
+                    &portfolio,
+                    &instruments,
+                    now,
+                );
                 {
                     let mut ctx = Ctx::new(
                         MarketView::new(&market),
@@ -339,9 +357,41 @@ impl<S: Strategy, D: DataSource, X: ExecutionClient> Engine<S, D, X> {
                 // bar-driven decision model), so it adds no strategy callback and
                 // does not move the equity curve.
                 market.push_signal(*instrument, *channel, *value);
+                // A signal carries the event clock forward, so any timer now due must
+                // still fire (m19/m21) even though a signal adds no strategy callback.
+                fire_due_timers(
+                    &mut strategy,
+                    &market,
+                    &mut gate,
+                    &portfolio,
+                    &instruments,
+                    now,
+                );
+                route_pending(&mut gate, &mut exec, now, &mut sink);
+                drain(
+                    &mut sink,
+                    &market,
+                    &mut gate,
+                    &mut portfolio,
+                    &mut strategy,
+                    &mut exec,
+                    &instruments,
+                    now,
+                );
             }
         }
 
+        // Final timer sweep: any timer scheduled for a time at/under the last event
+        // (e.g. queued by the last handler) fires before on_stop (m21); its orders are
+        // routed by the on_stop route_pending/drain below.
+        fire_due_timers(
+            &mut strategy,
+            &market,
+            &mut gate,
+            &portfolio,
+            &instruments,
+            now,
+        );
         {
             let mut ctx = Ctx::new(
                 MarketView::new(&market),
@@ -469,6 +519,26 @@ fn mark_to_market(market: &Market, portfolio: &Portfolio) -> Money {
         }
     }
     equity
+}
+
+/// Fire `on_timer` for every event-time timer now due at `now`, in event-time
+/// order. Called on EVERY event that advances the clock (not just bars) and once
+/// more at the loop tail, so a timer scheduled during a stretch of non-bar events
+/// (`Signal`/`Resync`) — or for a time at/under the final event — still fires
+/// (m19/m21). Does not route the orders it queues; the caller batches them with
+/// its own `route_pending` so a timer's orders go out with the event's.
+fn fire_due_timers<S: Strategy>(
+    strategy: &mut S,
+    market: &Market,
+    gate: &mut OrderGate,
+    portfolio: &Portfolio,
+    instruments: &[InstrumentSpec],
+    now: Timestamp,
+) {
+    for at in gate.drain_due_timers(now) {
+        let mut ctx = Ctx::new(MarketView::new(market), gate, portfolio, instruments, now);
+        strategy.on_timer(at, &mut ctx);
+    }
 }
 
 /// Route every action queued since the last drain to the execution client, in
@@ -820,6 +890,65 @@ mod tests {
         assert_eq!(r.spec_tick, 1, "instrument_spec is reachable from Ctx");
         // Bought 2 @ 110, marked at 120 on the last bar: unrealized = 2*(120-110).
         assert_eq!(r.unrealized_end, 20);
+    }
+
+    #[test]
+    fn timer_fires_on_non_bar_events_and_at_loop_tail() {
+        // m19/m21: a timer due during a stretch of non-bar events (Signal / Resync),
+        // or for a time at/under the final event, must still fire. Without the fix it
+        // only fired on the next Bar — and never if no bar followed.
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        #[derive(Default)]
+        struct Rec {
+            timer_ats: Vec<i64>,
+        }
+        struct Probe {
+            rec: Rc<RefCell<Rec>>,
+        }
+        impl Strategy for Probe {
+            fn on_start(&mut self, ctx: &mut Ctx<'_>) {
+                ctx.schedule(Timestamp::from_nanos(15)); // fires on the Signal @20
+                ctx.schedule(Timestamp::from_nanos(25)); // fires on the Resync @30
+                ctx.schedule(Timestamp::from_nanos(40)); // > last event ts: never fires
+            }
+            fn on_bar(&mut self, _bar: Bar, _ctx: &mut Ctx<'_>) {}
+            fn on_timer(&mut self, at: Timestamp, _ctx: &mut Ctx<'_>) {
+                self.rec.borrow_mut().timer_ats.push(at.as_nanos());
+            }
+        }
+
+        let inst = InstrumentId::new(0);
+        // One bar to seed, then ONLY non-bar events advance the clock past 15 and 25.
+        let events = vec![
+            Event::Bar(bar(0, 10, 100)),
+            Event::Signal {
+                instrument: inst,
+                channel: 1,
+                value: 7,
+                ts: Timestamp::from_nanos(20),
+            },
+            Event::Resync {
+                instrument: Some(inst),
+                ts: Timestamp::from_nanos(30),
+            },
+        ];
+        let rec = Rc::new(RefCell::new(Rec::default()));
+        Engine::new(
+            &[spec(0)],
+            Money::ZERO,
+            VecSource(events.into_iter()),
+            MockExec::default(),
+            Probe { rec: rec.clone() },
+        )
+        .unwrap()
+        .run();
+        assert_eq!(
+            rec.borrow().timer_ats,
+            vec![15, 25],
+            "timers due fire on the Signal (15) and Resync (25); 40 stays pending (no event reaches it)"
+        );
     }
 
     #[test]

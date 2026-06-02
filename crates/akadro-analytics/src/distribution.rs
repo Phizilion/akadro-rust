@@ -219,6 +219,7 @@ pub fn walk_forward_efficiency(oos: f64, is_: f64) -> f64 {
 
 /// A bundle of return-distribution statistics at a single confidence level.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct DistributionStats {
     /// Number of returns.
     pub n: usize,

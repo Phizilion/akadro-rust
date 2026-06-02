@@ -57,6 +57,13 @@ impl Indicator for RollingMax {
         }
         (self.count >= self.window).then(|| self.deque.front().expect("non-empty").1)
     }
+
+    fn warm_up_bars(&self) -> usize {
+        // `update` returns `None` until `count >= window`, so the first `Some`
+        // arrives on the `window`-th update (matching SMA's convention). The default
+        // `0` lied, panicking strategies that `is_warmed_up(ind.warm_up_bars())`.
+        self.window
+    }
 }
 
 /// Minimum value over the last `window` samples.
@@ -105,6 +112,10 @@ impl Indicator for RollingMin {
         }
         (self.count >= self.window).then(|| self.deque.front().expect("non-empty").1)
     }
+
+    fn warm_up_bars(&self) -> usize {
+        self.window // first `Some` on the `window`-th update; see `RollingMax`.
+    }
 }
 
 #[cfg(test)]
@@ -112,10 +123,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rolling_extremes_use_default_warm_up() {
-        // RollingMax/Min do not override the Indicator::warm_up_bars default (0).
-        assert_eq!(RollingMax::new(3).warm_up_bars(), 0);
-        assert_eq!(RollingMin::new(4).warm_up_bars(), 0);
+    fn rolling_extremes_warm_up_equals_first_some() {
+        // warm_up_bars() must equal the number of updates until the first Some, so a
+        // strategy guarding with `is_warmed_up(ind.warm_up_bars())` never unwraps None.
+        for window in [1usize, 3, 4, 7] {
+            let mut m = RollingMax::new(window);
+            let mut first_some = None;
+            for k in 1..=window + 2 {
+                if m.update(k as i64).is_some() {
+                    first_some = Some(k);
+                    break;
+                }
+            }
+            assert_eq!(m.warm_up_bars(), window);
+            assert_eq!(first_some, Some(window), "first Some on update {window}");
+            assert_eq!(RollingMin::new(window).warm_up_bars(), window);
+        }
     }
 
     #[test]

@@ -29,6 +29,7 @@ pub struct ReconnectingFeed {
     started: bool,
     last_ts: Timestamp,
     reconnect_delay: Option<Duration>,
+    connect_failed: bool,
 }
 
 impl ReconnectingFeed {
@@ -46,6 +47,7 @@ impl ReconnectingFeed {
             started: false,
             last_ts: Timestamp::EPOCH,
             reconnect_delay: Some(Duration::from_millis(500)),
+            connect_failed: false,
         }
     }
 
@@ -56,6 +58,15 @@ impl ReconnectingFeed {
         self.reconnect_delay = delay;
         self
     }
+
+    /// `true` if the feed finished because the factory never produced an **initial**
+    /// connection — a hard connect failure, distinct from a clean end-of-stream after
+    /// data flowed. Lets a live shell tell "the venue never came up" apart from "an
+    /// empty feed", which both otherwise surface as `next_event` returning `None`.
+    #[must_use]
+    pub fn connect_failed(&self) -> bool {
+        self.connect_failed
+    }
 }
 
 impl fmt::Debug for ReconnectingFeed {
@@ -63,6 +74,7 @@ impl fmt::Debug for ReconnectingFeed {
         f.debug_struct("ReconnectingFeed")
             .field("connected", &self.current.is_some())
             .field("started", &self.started)
+            .field("connect_failed", &self.connect_failed)
             .finish_non_exhaustive()
     }
 }
@@ -79,11 +91,19 @@ impl DataSource for ReconnectingFeed {
                     std::thread::sleep(d);
                 }
                 self.current = (self.factory)();
-                self.current.as_ref()?; // factory exhausted -> feed finished
-                if self.started {
-                    // A genuine reconnect: surface a resync before resuming. Note
-                    // `ts` is the LAST pre-disconnect event time — a *lower bound*
-                    // on the gap, not the reconnect instant. A connector
+                if self.current.is_none() {
+                    // Factory yielded no connection. If we never connected at all,
+                    // that's a hard connect failure (not a clean end-of-stream); flag
+                    // it so the caller can distinguish the two (m26).
+                    if !self.started {
+                        self.connect_failed = true;
+                    }
+                    return None;
+                }
+                if self.started && self.last_ts != Timestamp::EPOCH {
+                    // A genuine reconnect *after data flowed*: surface a resync before
+                    // resuming. Note `ts` is the LAST pre-disconnect event time — a
+                    // *lower bound* on the gap, not the reconnect instant. A connector
                     // reconciling fill history across the gap must re-fetch from
                     // `max(last_ts, now − lookback)`, never `last_ts` alone.
                     return Some(Event::Resync {
@@ -91,6 +111,9 @@ impl DataSource for ReconnectingFeed {
                         ts: self.last_ts,
                     });
                 }
+                // A reconnect before any event ever arrived (last_ts still EPOCH) has
+                // no gap to reconcile, so emitting an EPOCH-stamped resync would be
+                // meaningless (and back-dated); suppress it and just resume (m45).
                 self.started = true;
             }
             // `current` is Some here (just set above).
@@ -175,6 +198,48 @@ mod tests {
     fn empty_factory_is_immediately_done() {
         let mut f = ReconnectingFeed::new(|| None);
         assert!(f.next_event().is_none());
+    }
+
+    #[test]
+    fn no_resync_when_first_connection_yielded_no_events() {
+        // m45: the first connection opens but disconnects before any event arrives
+        // (last_ts still EPOCH), then a second connection brings data. There is no gap
+        // to reconcile, so no (back-dated, EPOCH-stamped) resync should be emitted.
+        let conns: Vec<Vec<Event>> = vec![vec![], vec![bar(3)]];
+        let mut it = conns.into_iter();
+        let mut f = ReconnectingFeed::new(move || {
+            it.next()
+                .map(|evs| Box::new(VecConn(evs.into_iter())) as Box<dyn DataSource>)
+        })
+        .with_reconnect_delay(None);
+        let mut got = Vec::new();
+        while let Some(e) = f.next_event() {
+            got.push(e);
+        }
+        assert_eq!(got.len(), 1, "only the real bar, no spurious EPOCH resync");
+        assert!(matches!(got[0], Event::Bar(_)));
+        assert_eq!(got[0].ts(), Timestamp::from_nanos(3));
+    }
+
+    #[test]
+    fn connect_failed_flags_initial_connection_failure() {
+        // m26: factory never produces a connection -> hard connect failure.
+        let mut f = ReconnectingFeed::new(|| None);
+        assert!(f.next_event().is_none());
+        assert!(f.connect_failed(), "never connected -> connect_failed");
+
+        // A feed that connected and ended cleanly is NOT a connect failure.
+        let mut once = Some(vec![bar(1)]);
+        let mut g = ReconnectingFeed::new(move || {
+            once.take()
+                .map(|evs| Box::new(VecConn(evs.into_iter())) as Box<dyn DataSource>)
+        })
+        .with_reconnect_delay(None);
+        while g.next_event().is_some() {}
+        assert!(
+            !g.connect_failed(),
+            "clean end-of-stream is not a connect failure"
+        );
     }
 }
 

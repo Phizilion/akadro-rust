@@ -83,8 +83,15 @@ fn schema_with_meta(instrument: InstrumentId, price_scale: u32, qty_scale: u32) 
     )
 }
 
-/// Write `bars` (all for one `instrument`) to `path` as a Feather partition.
-/// The instrument and fixed-point scales are stored in the file metadata.
+/// Write `bars` (all for one `instrument`, in ascending timestamp order) to `path`
+/// as an LZ4-compressed Feather partition. The instrument and fixed-point scales
+/// are stored in the file metadata so a reader reconstructs `Bar`s at the right
+/// scale. The write is atomic: it goes to a `.feather.tmp` sibling and is renamed
+/// into place on success, so a crash mid-write never leaves a truncated cache file.
+///
+/// # Errors
+/// Returns [`DataError::Arrow`] if Arrow batch/IPC construction or encoding fails,
+/// or [`DataError::Io`] if creating the temp file or renaming it into place fails.
 pub fn write_partition(
     path: &Path,
     instrument: InstrumentId,
@@ -264,8 +271,10 @@ pub struct BarSpec {
 }
 
 /// Load (or download-and-cache) bars for **many** instruments and merge them into
-/// one timestamp-ordered `Vec<Bar>` ready for `HistoricalFeed::from_bars` — the
-/// cross-sectional / multi-instrument loader. `make_source` builds the
+/// one timestamp-ordered `Vec<Bar>` — the cross-sectional / multi-instrument loader.
+/// To drive the engine, prefer [`load_or_cache_many_feed`] (returns a ready
+/// [`CachedFeed`]); this `Vec`-returning form is for analytics / inspection.
+/// `make_source` builds the
 /// [`DataSource`] for each [`BarSpec`] (typically a venue kline feed bound to that
 /// instrument's symbol). Each instrument is cached independently via
 /// [`load_or_cache`], then all bars are merged by event time with a **stable**
@@ -292,6 +301,53 @@ where
     }
     all.sort_by_key(|b| b.ts.as_nanos()); // stable merge by event time
     Ok(all)
+}
+
+/// [`load_or_cache`] but returns a ready-to-drive [`CachedFeed`] ([`DataSource`])
+/// instead of a `Vec<Bar>` — the **blessed cache→engine path** that needs no
+/// raw-`Vec` feed constructor. Fetch-if-missing (via `make_source`), cache, then
+/// replay; the bars are library-owned end to end (D18).
+///
+/// # Errors
+/// Returns a [`DataError`] if the fetch, cache write, or cache read fails.
+pub fn load_or_cache_feed<D, F>(
+    path: &Path,
+    instrument: InstrumentId,
+    price_scale: u32,
+    qty_scale: u32,
+    make_source: F,
+) -> Result<CachedFeed, DataError>
+where
+    D: DataSource,
+    F: FnOnce() -> D,
+{
+    Ok(CachedFeed::from_cached(load_or_cache(
+        path,
+        instrument,
+        price_scale,
+        qty_scale,
+        make_source,
+    )?))
+}
+
+/// [`load_or_cache_many`] but returns a single timestamp-merged [`CachedFeed`]
+/// ([`DataSource`]) over all instruments — the multi-instrument blessed cache→engine
+/// path (no raw-`Vec` feed constructor needed).
+///
+/// # Errors
+/// Returns a [`DataError`] if any instrument's fetch, cache write, or read fails.
+pub fn load_or_cache_many_feed<D, F>(
+    specs: &[BarSpec],
+    make_source: F,
+) -> Result<CachedFeed, DataError>
+where
+    D: DataSource,
+    F: Fn(&BarSpec) -> D,
+{
+    Ok(CachedFeed::from_cached(load_or_cache_many(
+        specs,
+        make_source,
+    )?))
 }
 
 /// Read a Feather partition written by [`write_partition`].
@@ -402,6 +458,34 @@ impl FeatherBarSource {
 }
 
 impl DataSource for FeatherBarSource {
+    fn next_event(&mut self) -> Option<Event> {
+        self.bars.next().map(Event::Bar)
+    }
+}
+
+/// A [`DataSource`] over bars that came from the akadro **cache layer** — the
+/// blessed cache→engine path. Constructed only by [`load_or_cache_feed`] /
+/// [`load_or_cache_many_feed`] (there is **no** public arbitrary-`Vec<Bar>`
+/// constructor): the bars are library-owned (fetched through a connector's
+/// `Transport` seam and validated on cache read), so feeding them to the engine
+/// never goes through a raw-`Vec` injection point (D18 — library owns the data).
+#[derive(Debug)]
+pub struct CachedFeed {
+    bars: std::vec::IntoIter<Bar>,
+}
+
+impl CachedFeed {
+    /// Crate-private: wrap library-owned cached bars. Deliberately not `pub` — the
+    /// only way to obtain a `CachedFeed` is via the `load_or_cache*_feed` loaders,
+    /// so user code cannot mint one over data it supplied itself.
+    pub(crate) fn from_cached(bars: Vec<Bar>) -> Self {
+        CachedFeed {
+            bars: bars.into_iter(),
+        }
+    }
+}
+
+impl DataSource for CachedFeed {
     fn next_event(&mut self) -> Option<Event> {
         self.bars.next().map(Event::Bar)
     }
@@ -627,6 +711,35 @@ mod tests {
     }
 
     #[test]
+    fn load_or_cache_feed_replays_cached_bars_in_order() {
+        // The blessed cache→engine path: a CachedFeed drives the engine directly,
+        // with no raw-Vec feed constructor in sight.
+        struct VecSrc(std::vec::IntoIter<Event>);
+        impl DataSource for VecSrc {
+            fn next_event(&mut self) -> Option<Event> {
+                self.0.next()
+            }
+        }
+        let path = tmp("load_or_cache_feed");
+        let _ = std::fs::remove_file(&path);
+        let bars = sample_bars();
+        let make = || {
+            let evs: Vec<Event> = bars.iter().copied().map(Event::Bar).collect();
+            VecSrc(evs.into_iter())
+        };
+        let mut feed = load_or_cache_feed(&path, InstrumentId::new(3), 2, 6, make).unwrap();
+        let mut drained = Vec::new();
+        while let Some(Event::Bar(b)) = feed.next_event() {
+            drained.push(b);
+        }
+        assert_eq!(
+            drained, bars,
+            "CachedFeed replays exactly the cached bars in order"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn load_or_cache_many_merges_instruments_by_timestamp() {
         struct VecSrc(std::vec::IntoIter<Event>);
         impl DataSource for VecSrc {
@@ -683,6 +796,69 @@ mod tests {
         // Empty specs → empty.
         let empty = load_or_cache_many(&[], |_| VecSrc(Vec::new().into_iter())).unwrap();
         assert!(empty.is_empty());
+        let _ = std::fs::remove_file(&p0);
+        let _ = std::fs::remove_file(&p1);
+    }
+
+    #[test]
+    fn load_or_cache_many_feed_merges_into_one_feed() {
+        struct VecSrc(std::vec::IntoIter<Event>);
+        impl DataSource for VecSrc {
+            fn next_event(&mut self) -> Option<Event> {
+                self.0.next()
+            }
+        }
+        let mk_bar = |inst: u32, ts: i64| {
+            Bar::new(
+                InstrumentId::new(inst),
+                Timestamp::from_nanos(ts),
+                Price::from_raw(1),
+                Price::from_raw(1),
+                Price::from_raw(1),
+                Price::from_raw(1),
+                Qty::from_raw(1),
+            )
+        };
+        let (p0, p1) = (tmp("manyfeed_0"), tmp("manyfeed_1"));
+        let _ = std::fs::remove_file(&p0);
+        let _ = std::fs::remove_file(&p1);
+        let specs = vec![
+            BarSpec {
+                path: p0.clone(),
+                instrument: InstrumentId::new(0),
+                price_scale: 0,
+                qty_scale: 0,
+            },
+            BarSpec {
+                path: p1.clone(),
+                instrument: InstrumentId::new(1),
+                price_scale: 0,
+                qty_scale: 0,
+            },
+        ];
+        let mut feed = load_or_cache_many_feed(&specs, |s| {
+            let bars = if s.instrument == InstrumentId::new(0) {
+                vec![mk_bar(0, 10), mk_bar(0, 30)]
+            } else {
+                vec![mk_bar(1, 20), mk_bar(1, 40)]
+            };
+            VecSrc(
+                bars.into_iter()
+                    .map(Event::Bar)
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            )
+        })
+        .unwrap();
+        let mut ts = Vec::new();
+        while let Some(Event::Bar(b)) = feed.next_event() {
+            ts.push(b.ts.as_nanos());
+        }
+        assert_eq!(
+            ts,
+            vec![10, 20, 30, 40],
+            "CachedFeed replays the merged stream in event-time order"
+        );
         let _ = std::fs::remove_file(&p0);
         let _ = std::fs::remove_file(&p1);
     }

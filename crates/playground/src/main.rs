@@ -40,7 +40,7 @@ use akadro::analytics::{PerformanceReport, TradeStats};
 use akadro::backtest::{diff_reports, replay_trades};
 use akadro::data::load_or_cache;
 use akadro::prelude::*;
-use akadro::types::{AssetId, InstrumentKind, InstrumentSpec, Timestamp};
+use akadro::types::{AssetId, InstrumentKind, InstrumentSpec, Timestamp, infer_funding_period_ms};
 use akadro_venue_mexc::{self as mexc, MexcCatalog, MexcKlineFeed, ReqwestTransport};
 use akadro_venue_okx as okx;
 
@@ -535,7 +535,7 @@ fn okx_funding(cfg: &Config, bar_ms: i64) -> Result<(Vec<(Timestamp, i64)>, u32)
     let mut transport = okx::ReqwestTransport::new()?;
     let schedule = okx::fetch_funding_history(&mut transport, &cfg.base_url, &cfg.symbol, 100)?;
     // Period (8h on most OKX perps, 4h on some) → `interval_bars` for the engine.
-    let period_ms = okx::funding_period_ms(&schedule);
+    let period_ms = infer_funding_period_ms(&schedule);
     let interval_bars = u32::try_from((period_ms / bar_ms).max(1)).unwrap_or(u32::MAX);
     Ok((schedule, interval_bars))
 }
@@ -554,14 +554,9 @@ fn mexc_futures_funding(cfg: &Config, bar_ms: i64) -> Result<(Vec<(Timestamp, i6
         &cfg.symbol,
         pages,
     )?;
-    // Settlement period = smallest positive gap between settlements (ms); fall back
-    // to MEXC's standard 8h if too few points to infer it.
-    let period_ms = schedule
-        .windows(2)
-        .map(|w| w[1].0.as_nanos() / 1_000_000 - w[0].0.as_nanos() / 1_000_000)
-        .filter(|d| *d > 0)
-        .min()
-        .unwrap_or(28_800_000);
+    // Settlement period (smallest positive gap, 8h fallback) → engine interval_bars,
+    // via the same venue-neutral inference the OKX path uses (DRY, m48).
+    let period_ms = infer_funding_period_ms(&schedule);
     let interval_bars = u32::try_from((period_ms / bar_ms).max(1)).unwrap_or(u32::MAX);
     Ok((schedule, interval_bars))
 }

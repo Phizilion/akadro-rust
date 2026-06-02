@@ -245,10 +245,14 @@ struct FuturesKlineData {
 /// Parse a MEXC futures `GET /api/v1/contract/kline/{symbol}` response (columnar
 /// arrays) into [`Bar`]s. The contract API reports each bar's **open** time
 /// (`time`, epoch-seconds); akadro — like spot REST/WS and the `HistoricalFeed` —
-/// stamps bars at **close** time, so one interval is added (m20). The interval is
-/// derived from consecutive opens (constant within a kline series); a single-bar
-/// response cannot derive it and is left at open time. Numeric prices/volumes are
-/// read via their exact decimal text, so no `f64` enters the money path.
+/// stamps bars at **close** time, so one interval is added (m20). `interval_secs` is
+/// the authoritative bar length (from the requested interval); it is used as the
+/// close offset so even a **single-bar** response is correctly close-stamped (m32) —
+/// not left at open time as deriving the interval from consecutive opens would force.
+/// As a fallback (`interval_secs <= 0`, an unrecognized interval) the interval is
+/// derived from consecutive opens, and a lone bar is left at open. Numeric
+/// prices/volumes are read via their exact decimal text, so no `f64` enters the
+/// money path.
 ///
 /// # Errors
 /// [`MexcError::Parse`] on unparseable JSON, an unsuccessful payload, mismatched
@@ -258,6 +262,7 @@ pub fn parse_futures_klines(
     instrument: InstrumentId,
     price_scale: u32,
     qty_scale: u32,
+    interval_secs: i64,
 ) -> Result<Vec<Bar>, MexcError> {
     let resp: FuturesKlineResp =
         serde_json::from_str(json).map_err(|e| MexcError::Parse(e.to_string()))?;
@@ -285,9 +290,17 @@ pub fn parse_futures_klines(
     let px =
         |v: &serde_json::Number| decimal_to_raw(&v.to_string(), price_scale).map(Price::from_raw);
     let qt = |v: &serde_json::Number| decimal_to_raw(&v.to_string(), qty_scale).map(Qty::from_raw);
-    // Interval (seconds) from consecutive opens, so each bar can be stamped at its
-    // close time = open + interval (m20). 0 for a single-bar response (left at open).
-    let interval_secs = if n >= 2 { d.time[1] - d.time[0] } else { 0 };
+    // Close offset (seconds): the caller's authoritative interval, so each bar —
+    // including a lone single-bar page — is stamped at close = open + interval (m20,
+    // m32). Fall back to deriving it from consecutive opens only when the caller
+    // didn't supply one (unrecognized interval); a single bar then stays at open.
+    let interval_secs = if interval_secs > 0 {
+        interval_secs
+    } else if n >= 2 {
+        d.time[1] - d.time[0]
+    } else {
+        0
+    };
     let mut bars = Vec::with_capacity(n);
     for i in 0..n {
         let close_secs = d.time[i]
@@ -502,6 +515,13 @@ pub fn fetch_contracts<T: Transport>(
 /// standard [`Event::Bar`]s, so the engine and strategies are unchanged. Pair with
 /// a `PerpetualFuture` [`InstrumentSpec`] from [`FuturesContract::to_spec`] and
 /// cache through the data layer.
+///
+/// **Unclosed last bar (no-range mode).** Without [`with_range`](Self::with_range)
+/// the feed fetches the most-recent window, whose last bar is the **in-progress**
+/// (still-forming) candle — its OHLCV mutates and its close time is in the future.
+/// A bounded [`with_range`](Self::with_range) back-fill ending before the present
+/// yields only closed bars; prefer it for reproducible runs, or drop the final bar
+/// of the no-range pull. (The contract API carries no per-bar "closed" flag here.)
 pub struct MexcFuturesKlineFeed<T> {
     transport: T,
     base_url: String,
@@ -629,6 +649,7 @@ impl<T: Transport> MexcFuturesKlineFeed<T> {
                 self.instrument,
                 self.price_scale,
                 self.qty_scale,
+                futures_interval_secs(&self.interval),
             );
         }
     }
@@ -886,7 +907,7 @@ mod feed_tests {
 
     #[test]
     fn parse_columnar_klines() {
-        let bars = parse_futures_klines(KLINES, InstrumentId::new(0), 2, 0).unwrap();
+        let bars = parse_futures_klines(KLINES, InstrumentId::new(0), 2, 0, 60).unwrap();
         assert_eq!(bars.len(), 2);
         // Stamped at CLOSE time = open + interval (60s here), matching spot/WS/feed
         // (m20): open 1700000000 + 60 → 1700000060s.
@@ -904,17 +925,38 @@ mod feed_tests {
 
     #[test]
     fn parse_error_paths() {
-        assert!(parse_futures_klines(r#"{"success":false}"#, InstrumentId::new(0), 2, 0).is_err());
+        assert!(
+            parse_futures_klines(r#"{"success":false}"#, InstrumentId::new(0), 2, 0, 60).is_err()
+        );
         // success but no data → empty.
         assert!(
-            parse_futures_klines(r#"{"success":true}"#, InstrumentId::new(0), 2, 0)
+            parse_futures_klines(r#"{"success":true}"#, InstrumentId::new(0), 2, 0, 60)
                 .unwrap()
                 .is_empty()
         );
         // column-length mismatch.
         let bad = r#"{"success":true,"data":{"time":[1],"open":[1,2],"high":[1],"low":[1],"close":[1],"vol":[1]}}"#;
-        assert!(parse_futures_klines(bad, InstrumentId::new(0), 2, 0).is_err());
-        assert!(parse_futures_klines("not json", InstrumentId::new(0), 2, 0).is_err());
+        assert!(parse_futures_klines(bad, InstrumentId::new(0), 2, 0, 60).is_err());
+        assert!(parse_futures_klines("not json", InstrumentId::new(0), 2, 0, 60).is_err());
+    }
+
+    #[test]
+    fn single_bar_is_close_stamped_from_passed_interval() {
+        // m32: a single-bar response can't derive the interval from consecutive opens.
+        // The passed interval (60s) must still close-stamp it (open 1700000000 + 60),
+        // not leave it at open time — otherwise a lone page stitches inconsistently
+        // with multi-bar pages.
+        let one = r#"{"success":true,"data":{"time":[1700000000],"open":[100],"high":[100],"low":[100],"close":[100],"vol":[1]}}"#;
+        let bars = parse_futures_klines(one, InstrumentId::new(0), 2, 0, 60).unwrap();
+        assert_eq!(bars.len(), 1);
+        assert_eq!(
+            bars[0].ts.as_nanos(),
+            1_700_000_060_000_000_000,
+            "single bar stamped at close = open + interval"
+        );
+        // With no interval supplied (0) and a single bar, it falls back to open time.
+        let fallback = parse_futures_klines(one, InstrumentId::new(0), 2, 0, 0).unwrap();
+        assert_eq!(fallback[0].ts.as_nanos(), 1_700_000_000_000_000_000);
     }
 
     #[test]

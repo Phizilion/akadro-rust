@@ -119,9 +119,10 @@ impl Manifest {
     /// Record (or update) a series after caching a partition.
     ///
     /// # Errors
-    /// Returns [`DataError::Schema`] if `range` overlaps the series' existing
-    /// cached history (`range.0 <= last_close_ts_nanos`) — appending an
-    /// overlapping partition would duplicate bars on read.
+    /// Returns [`DataError::Schema`] if `range` is reversed (`range.1 < range.0`),
+    /// or if it overlaps the series' existing cached history
+    /// (`range.0 <= last_close_ts_nanos`) — appending an overlapping partition would
+    /// duplicate bars on read.
     pub fn record(
         &mut self,
         venue: &str,
@@ -130,6 +131,11 @@ impl Manifest {
         partition_file: &str,
         range: (i64, i64),
     ) -> Result<(), DataError> {
+        if range.1 < range.0 {
+            return Err(DataError::Schema(format!(
+                "partition range {range:?} is reversed (end < start)"
+            )));
+        }
         if let Some(e) = self
             .entries
             .iter_mut()
@@ -245,6 +251,22 @@ mod tests {
             }],
         };
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn record_rejects_reversed_range() {
+        // m42: a range whose end precedes its start is malformed input; reject it
+        // fail-fast rather than record a nonsensical span (which would also corrupt
+        // last_close_ts_nanos).
+        let mut m = Manifest::default();
+        assert!(
+            m.record("mexc", "BTCUSDT", "1m", "a.feather", (200, 100))
+                .is_err(),
+            "a reversed (end < start) range must be rejected"
+        );
+        // A degenerate single-point range (start == end) is allowed.
+        m.record("mexc", "BTCUSDT", "1m", "a.feather", (100, 100))
+            .unwrap();
     }
 
     #[test]

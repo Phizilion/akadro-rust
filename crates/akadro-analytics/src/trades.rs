@@ -23,6 +23,7 @@ use akadro_engine::FillRecord;
 
 /// Aggregate statistics over completed (flat-to-flat) trades.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct TradeStats {
     /// Number of completed trades.
     pub num_trades: usize,
@@ -198,15 +199,15 @@ mod tests {
 
     fn fill(side: Side, price: i64, qty: i64, fee: i128) -> FillRecord {
         let _ = Costs::new(); // keep the import meaningful across versions
-        FillRecord {
-            id: ClientOrderId::new(0),
-            instrument: InstrumentId::new(0),
+        FillRecord::new(
+            ClientOrderId::new(0),
+            InstrumentId::new(0),
             side,
-            price: Price::from_raw(price),
-            qty: Qty::from_raw(qty),
-            fee: Money::from_raw(fee),
-            ts: Timestamp::from_nanos(1),
-        }
+            Price::from_raw(price),
+            Qty::from_raw(qty),
+            Money::from_raw(fee),
+            Timestamp::from_nanos(1),
+        )
     }
 
     fn approx(a: f64, b: f64) -> bool {
@@ -309,15 +310,15 @@ mod cov_tests {
     use super::*;
     use akadro_core::{ClientOrderId, InstrumentId, Money, Price, Qty, Side, Timestamp};
     fn f(side: Side, price: i64, qty: i64) -> FillRecord {
-        FillRecord {
-            id: ClientOrderId::new(0),
-            instrument: InstrumentId::new(0),
+        FillRecord::new(
+            ClientOrderId::new(0),
+            InstrumentId::new(0),
             side,
-            price: Price::from_raw(price),
-            qty: Qty::from_raw(qty),
-            fee: Money::ZERO,
-            ts: Timestamp::from_nanos(1),
-        }
+            Price::from_raw(price),
+            Qty::from_raw(qty),
+            Money::ZERO,
+            Timestamp::from_nanos(1),
+        )
     }
     #[test]
     fn flip_through_zero_is_one_trade() {

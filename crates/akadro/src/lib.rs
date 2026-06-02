@@ -18,20 +18,33 @@
 //!   (enabled by the default `backtest` feature).
 //!
 //! ```
+//! // Gated on `backtest` (the default feature) for `SimulatedExchange`, so a
+//! // `--no-default-features` build compiles an empty body (m39). Data reaches the
+//! // engine via a `DataSource` — the blessed path is `akadro::data::load_or_cache_feed`
+//! // (cache → feed) or a venue connector feed; for an ad-hoc source you implement
+//! // `DataSource` (shown here with an empty one). The raw `HistoricalFeed::from_bars`
+//! // Vec-injection constructor is gated behind the `import-bars` feature (D18).
+//! # #[cfg(feature = "backtest")] {
 //! use akadro::prelude::*;
+//! use akadro::types::{DataSource, Event};
 //!
 //! struct Flat;
 //! impl Strategy for Flat {
 //!     fn on_bar(&mut self, _bar: Bar, _ctx: &mut Ctx<'_>) {}
 //! }
+//! struct NoData;
+//! impl DataSource for NoData {
+//!     fn next_event(&mut self) -> Option<Event> { None }
+//! }
 //!
 //! let spec = InstrumentSpec::new(InstrumentId::new(0), AssetId::new(0), AssetId::new(1),
 //!     InstrumentKind::Spot, Price::from_raw(1), Qty::from_raw(1), Money::ZERO, CapSet::empty());
 //! let report = Engine::new(
-//!     &[spec], Money::ZERO, HistoricalFeed::from_bars(Vec::new()),
+//!     &[spec], Money::ZERO, NoData,
 //!     SimulatedExchange::new(Vec::new(), 0), Flat,
 //! ).unwrap().run();
 //! assert_eq!(report.bars_processed, 0);
+//! # }
 //! ```
 
 #[cfg(feature = "analytics")]

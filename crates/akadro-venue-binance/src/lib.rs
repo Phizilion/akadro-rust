@@ -159,62 +159,21 @@ impl Transport for MockTransport {
 
 // --- fixed-point decimal helpers ---------------------------------------------
 
-/// Number of significant fractional digits in a decimal string (trailing zeros
-/// stripped): `"0.01000000"` → 2, `"1.00000000"` → 0.
-#[must_use]
-pub fn scale_of(decimal: &str) -> u32 {
-    match decimal.split_once('.') {
-        Some((_, frac)) => frac.trim_end_matches('0').len() as u32,
-        None => 0,
-    }
-}
+// `scale_of` (fractional-digit count) and `raw_to_decimal` (fixed-point → string)
+// are venue-neutral, so they live in `akadro-core` (DRY across all connectors) and
+// are re-exported here for the connector's public surface.
+pub use akadro_core::{raw_to_decimal, scale_of};
 
 /// Parse a decimal string to a raw fixed-point `i64` at `scale` (truncating any
 /// digits beyond `scale`). `"0.01"` @ scale 2 → `1`; `"123.456"` @ 2 → `12345`.
+/// Thin adapter over [`akadro_core::decimal_to_raw`] mapping a rejected/overflowing
+/// value to this connector's error type.
 ///
 /// # Errors
-/// [`BinanceError::Parse`] if the integer/fraction parts are not digits.
+/// [`BinanceError::Parse`] if `s` is empty, non-numeric, or overflows `i64`.
 pub fn decimal_to_raw(s: &str, scale: u32) -> Result<i64, BinanceError> {
-    let neg = s.starts_with('-');
-    let s = s.trim_start_matches('-');
-    let (int_part, frac_part) = s.split_once('.').unwrap_or((s, ""));
-    let int_part = if int_part.is_empty() { "0" } else { int_part };
-    let mut frac = frac_part.to_string();
-    let scale_us = scale as usize;
-    frac.truncate(scale_us); // drop excess precision
-    while frac.len() < scale_us {
-        frac.push('0');
-    }
-    let combined = format!("{int_part}{frac}");
-    let val: i64 = combined
-        .parse()
-        .map_err(|_| BinanceError::Parse(format!("bad decimal {s:?}")))?;
-    Ok(if neg { -val } else { val })
-}
-
-/// Format a raw fixed-point `i64` at `scale` back to a decimal string for a query
-/// param: `(12345, 2)` → `"123.45"`, `(50, 0)` → `"50"`.
-#[must_use]
-pub fn raw_to_decimal(raw: i64, scale: u32) -> String {
-    // Clamp to the largest base-10 exponent a u128 holds (`10u128.pow(39)`
-    // overflows). No real venue uses a scale this large, but the guard prevents a
-    // panic (m13).
-    let scale = scale.min(38);
-    if scale == 0 {
-        return raw.to_string();
-    }
-    let neg = raw < 0;
-    let mag = raw.unsigned_abs();
-    let div = 10u128.pow(scale);
-    let int = (u128::from(mag) / div).to_string();
-    let frac = format!("{:0width$}", u128::from(mag) % div, width = scale as usize);
-    let frac = frac.trim_end_matches('0');
-    let s = if frac.is_empty() {
-        int
-    } else {
-        format!("{int}.{frac}")
-    };
-    if neg { format!("-{s}") } else { s }
+    akadro_core::decimal_to_raw(s, scale)
+        .ok_or_else(|| BinanceError::Parse(format!("bad decimal {s:?} at scale {scale}")))
 }
 
 // --- catalogue (exchangeInfo → InstrumentSpec) -------------------------------
@@ -451,6 +410,15 @@ pub const MAX_KLINES_LIMIT: u32 = 1000;
 
 /// Parse a `/api/v3/klines` array body into [`Bar`]s (row layout
 /// `[openTime, "o","h","l","c","v", closeTime, …]`; stamped at close time).
+///
+/// **Unclosed last candle.** Unlike some venues, a Binance kline row carries no
+/// "is-closed" flag. When the requested range reaches the present, the **last** row
+/// is the still-forming candle (its `closeTime` lies in the future and its OHLCV
+/// will keep changing). This parser cannot detect that without a server clock, so
+/// it returns every row as-is. For backfill over a bounded historical window
+/// (`end_ms` in the past) no in-progress candle appears; when fetching *to now*,
+/// pass an `end_ms` before the current interval boundary, or drop a trailing bar
+/// whose `closeTime` exceeds server time, so a strategy never sees a mutating bar.
 ///
 /// # Errors
 /// [`BinanceError::Parse`] on bad JSON, a short row, or a bad number.
@@ -848,8 +816,19 @@ impl<T: Transport> ExecutionClient for BinanceSpotExec<T> {
                 return;
             }
         };
-        if self.futures && order.reduce_only {
-            params.push_str("&reduceOnly=true");
+        if order.reduce_only {
+            if self.futures {
+                params.push_str("&reduceOnly=true");
+            } else {
+                // Spot has no reduce-only; reject rather than silently send a
+                // position-increasing order — parity with OKX/KuCoin + the simulator.
+                sink.emit(AccountEvent::OrderRejected {
+                    id,
+                    reason: RejectReason::InvalidOrder,
+                    ts: now,
+                });
+                return;
+            }
         }
         // Tag the order so a live user-data fill attributes back to this id
         // (see `ws::client_order_tag`); part of the signed query.
@@ -1269,8 +1248,9 @@ mod tests {
     }
 
     #[test]
-    fn spot_exec_does_not_forward_reduce_only() {
-        // The same reduce_only request on the spot path omits reduceOnly entirely.
+    fn spot_exec_rejects_reduce_only() {
+        // Spot has no reduce-only: the order is rejected locally (no request sent),
+        // matching OKX/KuCoin + the simulator, not silently dropping the flag.
         let mut x = exec_with(vec![HttpResponse {
             status: 200,
             body: "{}".into(),
@@ -1284,9 +1264,8 @@ mod tests {
             Timestamp::from_nanos(1),
             &mut s,
         );
-        let sent = &x.transport.sent[0];
-        assert!(sent.url.contains("/api/v3/order?"));
-        assert!(!sent.url.contains("reduceOnly"));
+        assert!(matches!(s.0[0], AccountEvent::OrderRejected { .. }));
+        assert!(x.transport.sent.is_empty()); // rejected before any request
     }
 
     #[test]

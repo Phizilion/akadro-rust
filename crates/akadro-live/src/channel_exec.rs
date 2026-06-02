@@ -58,10 +58,15 @@ impl<X: ExecutionClient> ExecutionClient for ChannelExec<X> {
         // Let the inner client react first (a live REST client's observe is a
         // no-op; this also keeps a simulated inner client working in tests).
         self.inner.observe(event, now, sink);
-        // Drain every account event that has arrived asynchronously, in order,
-        // without blocking the synchronous engine.
-        while let Ok(account_event) = self.fills.try_recv() {
-            sink.emit(account_event);
+        // Surface async fills at BAR boundaries only, matching the backtest parity
+        // contract (resting orders fill before on_bar). Draining on interleaved
+        // signal/resync events would surface fills at a point with no backtest
+        // analog, diverging the event ordering (m27); events buffer in the channel
+        // (no loss) until the next bar.
+        if matches!(event, Event::Bar(_)) {
+            while let Ok(account_event) = self.fills.try_recv() {
+                sink.emit(account_event);
+            }
         }
     }
 
@@ -71,6 +76,14 @@ impl<X: ExecutionClient> ExecutionClient for ChannelExec<X> {
 
     fn command(&mut self, command: VenueCommand, now: Timestamp, sink: &mut dyn EventSink) {
         self.inner.command(command, now, sink);
+    }
+
+    fn sync_clock(&mut self, wall_ms: i64) {
+        // Pass the live shell's wall-clock through to the inner venue client so its
+        // signed-request timestamp stays current (m4). Without this delegation the
+        // call would hit the trait's no-op default and the wrapped venue client would
+        // sign with a stale clock.
+        self.inner.sync_clock(wall_ms);
     }
 
     fn config_seed(&self) -> Option<u64> {
@@ -84,11 +97,13 @@ mod tests {
     use akadro_core::{Bar, InstrumentId, Price, Qty};
     use std::sync::mpsc::channel;
 
-    /// An inner client that records whether submit/observe were delegated.
+    /// An inner client that records whether `submit`/`observe`/`sync_clock` were
+    /// delegated.
     #[derive(Default)]
     struct SpyExec {
         submits: u32,
         observes: u32,
+        last_clock_ms: Option<i64>,
     }
     impl ExecutionClient for SpyExec {
         fn submit(
@@ -102,6 +117,16 @@ mod tests {
         }
         fn observe(&mut self, _event: &Event, _now: Timestamp, _sink: &mut dyn EventSink) {
             self.observes += 1;
+        }
+        fn sync_clock(&mut self, wall_ms: i64) {
+            self.last_clock_ms = Some(wall_ms);
+        }
+    }
+
+    fn a_resync() -> Event {
+        Event::Resync {
+            instrument: Some(InstrumentId::new(0)),
+            ts: Timestamp::from_nanos(1),
         }
     }
 
@@ -191,6 +216,39 @@ mod tests {
         assert_eq!(exec.inner.submits, 1);
         exec.observe(&a_bar(), Timestamp::from_nanos(1), &mut sink);
         assert!(sink.is_empty(), "no async events → nothing emitted");
+    }
+
+    #[test]
+    fn sync_clock_delegates_to_inner() {
+        // m4: a sync_clock call must reach the wrapped venue client, not vanish into
+        // the trait's no-op default (which would leave the venue signing stale).
+        let (_tx, rx) = channel::<AccountEvent>();
+        let mut exec = ChannelExec::new(SpyExec::default(), rx);
+        exec.sync_clock(1_700_000_000_000);
+        assert_eq!(exec.inner.last_clock_ms, Some(1_700_000_000_000));
+    }
+
+    #[test]
+    fn drain_is_gated_on_bar_events() {
+        // m27: async fills surface only at bar boundaries (parity contract). A resync
+        // event delegates to inner but must NOT drain the channel; the next bar does.
+        let (tx, rx) = channel();
+        let mut exec = ChannelExec::new(SpyExec::default(), rx);
+        tx.send(an_ack(1)).unwrap();
+        let mut sink: Vec<AccountEvent> = Vec::new();
+
+        exec.observe(&a_resync(), Timestamp::from_nanos(1), &mut sink);
+        assert!(
+            sink.is_empty(),
+            "a non-bar event must not drain async fills"
+        );
+        assert_eq!(
+            exec.inner.observes, 1,
+            "inner observe still delegated on a resync"
+        );
+
+        exec.observe(&a_bar(), Timestamp::from_nanos(2), &mut sink);
+        assert_eq!(sink.len(), 1, "the buffered fill drains on the next bar");
     }
 
     #[test]

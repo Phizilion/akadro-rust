@@ -76,8 +76,13 @@ impl Transport for ReqwestTransport {
         // * A **418** (IP ban) will not clear in seconds, and sleeping ~minutes on
         //   the (synchronous) engine thread is unacceptable — return it immediately
         //   for the operator/strategy to back off at a higher level.
-        // * Only an **unsigned** public request (klines / exchangeInfo) on a 429 is
-        //   safe to retry in place, with a short bounded backoff.
+        // * Only an **unsigned** public request (klines / exchangeInfo) is safe to
+        //   retry in place (on a 429 or a transient transport error), with a short
+        //   bounded backoff. A signed request is NOT retried on a transport error
+        //   either: across up to four attempts the cumulative backoff (~3s) plus
+        //   network time can push the baked-in signing timestamp past `recvWindow`
+        //   and earn a 700003 — so return it immediately and let the bar-cadence
+        //   poller re-sign next bar (m33).
         let signed = request.api_key.is_some();
         let mut attempt = 0u32;
         loop {
@@ -91,12 +96,13 @@ impl Transport for ReqwestTransport {
                     return Ok(resp);
                 }
                 Err(e) => {
+                    if signed {
+                        return Err(e); // never sleep-and-retry a baked signature (m33)
+                    }
                     attempt += 1;
                     if attempt > 4 {
                         return Err(e);
                     }
-                    // ~0.3s..1.2s — well under a 5s recvWindow even for signed
-                    // requests, so a transient retry never invalidates the signature.
                     std::thread::sleep(Duration::from_millis(300 * u64::from(attempt)));
                 }
             }

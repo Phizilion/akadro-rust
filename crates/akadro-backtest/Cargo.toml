@@ -12,8 +12,20 @@ categories.workspace = true
 [dependencies]
 akadro-core.workspace = true
 akadro-engine.workspace = true
+# Walk-forward window types + slicing for the framework-owned OOS runner. No cycle:
+# akadro-analytics depends only on akadro-core + akadro-engine, never on backtest.
+akadro-analytics.workspace = true
 smallvec.workspace = true
 rand_core.workspace = true
+
+[features]
+# Off by default. Re-exposes the casual raw-`Vec<Bar>`/`Vec<Event>` feed constructors
+# `HistoricalFeed::{new, from_bars, try_from_bars}` — the D18 data-injection door.
+# The blessed path is `akadro_data::load_or_cache_feed` (cache → DataSource) or a
+# venue connector feed; to supply your own data, implement `DataSource` deliberately.
+# Synthetic-data unit tests, the umbrella integration tests, and the playground enable
+# this; the agentic strategy lab does NOT (so a lab agent has no casual injection point).
+import-bars = []
 
 [lints]
 workspace = true

@@ -16,7 +16,7 @@
 #   ├── src/strategies/mod.rs   the ONLY place the agent edits
 #   ├── api/{doc,json,examples} bundled public API (no akadro source)
 #   ├── .claude/settings.json   deny-list: no reading akadro source, locked files
-#   └── scripts/{refresh-akadro-api,verify-no-unsafe}.sh
+#   └── scripts/{refresh-akadro-api,verify-no-unsafe,verify-no-custom-datasource}.sh
 #
 # Usage:  agentic/scaffold-lab.sh <target-dir> [--force]
 #
@@ -111,7 +111,9 @@ use akadro::prelude::*;
 
 /// Entry point, called by `main()`. Replace the body with your research.
 pub fn run() {
-    // Starter smoke test: an empty backtest proving the toolchain + akadro resolve.
+    // Starter smoke test: construct the pieces that need no data, proving the
+    // toolchain + akadro resolve. (No `HistoricalFeed::from_bars` — raw Vec injection
+    // is gated off here — and no custom `DataSource`, which is forbidden in this lab.)
     let spec = InstrumentSpec::new(
         InstrumentId::new(0),
         AssetId::new(0),
@@ -122,17 +124,22 @@ pub fn run() {
         Money::ZERO,
         CapSet::empty(),
     );
-    let report = Engine::new(
-        &[spec],
-        Money::ZERO,
-        HistoricalFeed::from_bars(Vec::new()),
-        SimulatedExchange::new(Vec::new(), 0),
-        Flat,
-    )
-    .expect("engine construction")
-    .run();
+    let _exchange = SimulatedExchange::new(vec![spec], 0);
+    let _strategy = Flat;
 
-    println!("lab OK — bars processed: {}", report.bars_processed);
+    // Your real backtest gets its feed ONLY from the akadro data API — never your own
+    // data. Uncomment and adapt (see GUIDE.md + api/examples/full_pipeline.rs):
+    //
+    //   use std::path::Path;
+    //   let feed = akadro::data::load_or_cache_feed(
+    //       Path::new("cache/BTCUSDT-1m.feather"), spec.id, /*price_scale*/ 2, /*qty_scale*/ 6,
+    //       || akadro_venue_mexc::MexcKlineFeed::new(/* base_url, symbol, ... */),
+    //   ).expect("fetch/cache");
+    //   let report = Engine::new(&[spec], Money::from_raw(1_000_000), feed,
+    //       SimulatedExchange::new(vec![spec], 0), Flat).unwrap().run();
+    //   println!("bars processed: {}", report.bars_processed);
+
+    println!("lab OK — akadro resolves; drive the Engine with akadro::data::load_or_cache_feed(..)");
 }
 
 /// Starter strategy: flat (does nothing). Replace with your logic.
@@ -191,8 +198,10 @@ API_DIR="$LAB_DIR/api"
 CARGO="${CARGO:-cargo}"
 echo "akadro: $AKADRO_DIR  ->  bundle: $API_DIR"
 
-# 1. HTML docs (umbrella, all features), then strip the source browser.
-( cd "$AKADRO_DIR" && "$CARGO" doc --no-deps -p akadro --all-features >/dev/null )
+# 1. HTML docs. The umbrella is built with the LAB'S feature set (not --all-features)
+#    so the off-by-default `escape-hatch` footgun API (the IS/OOS-leaking generic
+#    walk-forward runners) is NOT advertised — the docs match what the lab can call.
+( cd "$AKADRO_DIR" && "$CARGO" doc --no-deps -p akadro --features "analytics,indicators,data" >/dev/null )
 ( cd "$AKADRO_DIR" && "$CARGO" doc --no-deps -p akadro-venue-mexc --all-features >/dev/null 2>&1 ) || true
 rm -rf "$API_DIR/doc"; mkdir -p "$API_DIR"
 cp -r "$AKADRO_DIR/target/doc" "$API_DIR/doc"
@@ -205,7 +214,15 @@ if PATH="$HOME/.cargo/bin:$PATH" rustup run nightly rustdoc --version >/dev/null
   for c in akadro-core akadro-engine akadro-backtest akadro-analytics \
            akadro-indicators akadro-data akadro-live akadro-testkit \
            akadro-venue-mexc akadro; do
-    if ( cd "$AKADRO_DIR" && "$CARGO" +nightly rustdoc -p "$c" --all-features \
+    # Match the lab's feature set: never enable the off-by-default `escape-hatch`
+    # footgun feature (only `akadro` + `akadro-analytics` define it).
+    case "$c" in
+      akadro)           feats="--features analytics,indicators,data" ;;
+      akadro-analytics) feats="" ;;
+      *)                feats="--all-features" ;;
+    esac
+    # shellcheck disable=SC2086 # $feats is an intentional word-split flag list
+    if ( cd "$AKADRO_DIR" && "$CARGO" +nightly rustdoc -p "$c" $feats \
            -- -Z unstable-options --output-format json >/dev/null 2>&1 ); then
       cp "$AKADRO_DIR/target/doc/${c//-/_}.json" "$API_DIR/json/"
     fi
@@ -275,6 +292,36 @@ VERIFY_BODY
 } > "$LAB_DIR/scripts/verify-no-unsafe.sh"
 chmod +x "$LAB_DIR/scripts/verify-no-unsafe.sh"
 
+# --- scripts/verify-no-custom-datasource.sh -----------------------------------
+# Enforces the hard rule "No custom DataSource": hand-rolling a feed/exchange trait
+# is the one remaining way to import your own data, so it is disallowed in the lab.
+{
+  printf '#!/usr/bin/env bash\n'
+  printf '# Trusted gate: the lab forbids hand-rolling a feed/exchange to import data.\n'
+  printf '# Data must come only from akadro::data::load_or_cache_feed / connector feeds.\n'
+  printf '# Run as MAINTAINER / in CI (the agent cannot edit this script).\n'
+  printf 'set -uo pipefail\n'
+  cat <<'DS_BODY'
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LAB_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+echo "== verify-no-custom-datasource: $LAB_DIR/src/strategies =="
+# Reject any `impl <...> DataSource|ExecutionClient|InstrumentCatalog for ...` in the
+# agent-editable code: those are the feed/exchange seams that would let a strategy
+# inject its own data (the D18 leakage point). The blessed path is the data API.
+hits="$(grep -rnE 'impl([[:space:]]|<).*\b(DataSource|ExecutionClient|InstrumentCatalog)\b[[:space:]]+for' "$LAB_DIR/src/strategies" 2>/dev/null || true)"
+if [ -n "$hits" ]; then
+  echo "  FAIL : custom data/venue trait impl found (disallowed — use load_or_cache_feed):"
+  echo "$hits" | sed 's/^/         /'
+  echo "RESULT: FAIL — remove the custom DataSource; get data via akadro::data::load_or_cache_feed."
+  exit 1
+fi
+echo "  ok   : no custom DataSource / ExecutionClient / InstrumentCatalog impl"
+echo "RESULT: PASS — no custom data source."
+exit 0
+DS_BODY
+} > "$LAB_DIR/scripts/verify-no-custom-datasource.sh"
+chmod +x "$LAB_DIR/scripts/verify-no-custom-datasource.sh"
+
 # --- build the API bundle -----------------------------------------------------
 echo "generating API bundle ..."
 "$LAB_DIR/scripts/refresh-akadro-api.sh" | sed 's/^/  /'
@@ -285,3 +332,4 @@ echo "  agent reads : GUIDE.md, api/doc/akadro/index.html, api/json/, api/exampl
 echo "  agent writes: src/strategies/"
 echo "  build/run   : ( cd '$LAB_DIR' && cargo run )"
 echo "  verify safe : '$LAB_DIR/scripts/verify-no-unsafe.sh'   (run after each session)"
+echo "  verify data : '$LAB_DIR/scripts/verify-no-custom-datasource.sh'   (no self-imported data)"

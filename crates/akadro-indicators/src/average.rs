@@ -110,9 +110,14 @@ impl Indicator for Ema {
             }
             Some(prev) => {
                 // ema += (input - prev) * 2 / (period + 1); widen so a large price
-                // delta can't overflow the `* 2` (m31).
+                // delta can't overflow the `* 2` (m31). Clamp the i128 result into
+                // i64 — a bare `step as i64` would truncate before the saturate.
                 let step = (i128::from(input) - i128::from(prev)) * 2 / (self.period as i128 + 1);
-                let next = prev.saturating_add(step as i64);
+                let next = i64::try_from(i128::from(prev) + step).unwrap_or(if step > 0 {
+                    i64::MAX
+                } else {
+                    i64::MIN
+                });
                 self.current = Some(next);
                 Some(next)
             }

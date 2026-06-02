@@ -192,19 +192,25 @@ if qty_raw > 0 { ctx.submit(OrderRequest::market(self.inst, Side::Buy, Qty::from
 
 ## 8. Getting data — only through akadro (rule)
 
-Never download data yourself. Use the akadro data API:
+Never load your own data. Get the engine's feed ONLY from the akadro data API — it
+returns a ready `DataSource`, so you never touch a raw `Vec<Bar>`:
 
 ```rust
-use akadro::data::load_or_cache;            // download-once, replay-from-cache
-use akadro_venue_mexc::{MexcKlineFeed, MexcCatalog, ReqwestTransport};
+use akadro::data::load_or_cache_feed;       // download-once / replay-from-cache → feed
+use akadro_venue_mexc::MexcKlineFeed;        // (and other akadro_venue_* connector feeds)
 
-// Drive an in-memory Vec<Bar> obtained via akadro:
-let feed = HistoricalFeed::from_bars(bars);
+// Cache miss → fetch via the connector; cache hit → replay. Returns a DataSource.
+let feed = load_or_cache_feed(
+    cache_path, instrument, price_scale, qty_scale,
+    || MexcKlineFeed::new(/* base_url, symbol, ... */).with_range(start_ms, end_ms),
+)?;
 ```
 
-`api/examples/full_pipeline.rs` is the complete, sanctioned flow:
-exchangeInfo → klines → Feather cache → backtest → analytics → replay oracle.
-Do **not** write your own HTTP fetcher or read foreign data files (see `CLAUDE.md`).
+The raw `HistoricalFeed::from_bars`/`new` Vec-injection constructors are **gated off**
+(feature `import-bars`, off by default), and a **custom `DataSource` is disallowed** in
+the lab — those are the data-leakage doors. `api/examples/full_pipeline.rs` shows the
+complete sanctioned flow: exchangeInfo → klines → Feather cache → backtest → analytics
+→ replay oracle. Do **not** write your own HTTP fetcher or read foreign data files.
 
 ---
 
@@ -214,7 +220,7 @@ Do **not** write your own HTTP fetcher or read foreign data files (see `CLAUDE.m
 let exchange = SimulatedExchange::new(specs.clone(), fee_bps)
     .with_starting_cash(Money::from_raw(cash_raw));   // optional cash guard
 let report = Engine::new(&specs, Money::from_raw(cash_raw),
-                         HistoricalFeed::from_bars(bars), exchange, strategy)
+                         feed, exchange, strategy)     // `feed` from load_or_cache_feed
     .expect("engine")
     .run();                                            // -> RunReport
 ```

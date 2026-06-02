@@ -11,6 +11,10 @@
 //! the *same* strategy runs live (goal 2).
 //!
 //! ```
+//! // The raw `HistoricalFeed::from_bars` constructor is gated behind `import-bars`
+//! // (D18); this example shows it under that feature. The default data path is
+//! // `akadro_data::load_or_cache_feed` (cache → DataSource) or a connector feed.
+//! # #[cfg(feature = "import-bars")] {
 //! use akadro_backtest::{HistoricalFeed, SimulatedExchange};
 //! use akadro_engine::{Engine, Strategy, Ctx};
 //! use akadro_core::{Bar, InstrumentSpec, InstrumentId, AssetId, InstrumentKind,
@@ -36,12 +40,16 @@
 //!     HistoricalFeed::from_bars(bars), SimulatedExchange::new(vec![spec], 0), Buy1,
 //! ).unwrap().run();
 //! assert_eq!(report.bars_processed, 2);
+//! # }
 //! ```
 
 mod exchange;
 mod feed;
 pub mod replay;
+mod walk_forward_run;
 
+pub use akadro_core::BarOrderError;
 pub use exchange::{FillConfig, SimulatedExchange};
 pub use feed::HistoricalFeed;
 pub use replay::{ReplayDiff, ReplayFeed, ReplayStrategy, diff_reports, replay_trades};
+pub use walk_forward_run::{OosFold, WalkForwardBacktest};

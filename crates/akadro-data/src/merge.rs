@@ -28,6 +28,9 @@ pub struct MergeSource {
     sources: Vec<Box<dyn DataSource>>,
     heads: Vec<Option<Event>>,
     primed: bool,
+    /// Timestamp of the last event emitted, to assert the merged stream stays
+    /// non-decreasing (a child that violates its own contract is caught in debug).
+    last_ts: i64,
 }
 
 impl MergeSource {
@@ -42,6 +45,7 @@ impl MergeSource {
             sources,
             heads,
             primed: false,
+            last_ts: i64::MIN,
         }
     }
 
@@ -68,7 +72,18 @@ impl DataSource for MergeSource {
                 }
             }
         }
-        let (chosen, _) = best?;
+        let (chosen, chosen_ts) = best?;
+        // The merged stream must be non-decreasing (the engine's look-ahead contract).
+        // Since each child is required to be non-decreasing and we always emit the
+        // earliest head, this holds — unless a child violates its own contract; catch
+        // that in debug rather than letting an out-of-order event reach a strategy.
+        debug_assert!(
+            chosen_ts >= self.last_ts,
+            "MergeSource child {chosen} produced an out-of-order event (ts {chosen_ts} < \
+             last emitted {}); every child must be non-decreasing in time",
+            self.last_ts
+        );
+        self.last_ts = chosen_ts;
         let event = self.heads[chosen].take();
         // Refill the child we just drained.
         self.heads[chosen] = self.sources[chosen].next_event();

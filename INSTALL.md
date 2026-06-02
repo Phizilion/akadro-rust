@@ -71,13 +71,13 @@ the repo can build it. Cargo fetches and compiles it like any dependency.
 
 ```toml
 [dependencies]
-akadro = { git = "ssh://git@<your-host>/<org>/akadro-rust.git", tag = "v0.1.1", \
+akadro = { git = "ssh://git@<your-host>/<org>/akadro-rust.git", tag = "v0.1.2", \
            features = ["analytics", "data"] }
-akadro-venue-mexc = { git = "ssh://git@<your-host>/<org>/akadro-rust.git", tag = "v0.1.1", \
+akadro-venue-mexc = { git = "ssh://git@<your-host>/<org>/akadro-rust.git", tag = "v0.1.2", \
                       features = ["net"] }
 ```
 
-- **Always pin** with `tag = "v0.1.1"` (or `rev = "<sha>"`) for reproducible
+- **Always pin** with `tag = "v0.1.2"` (or `rev = "<sha>"`) for reproducible
   builds — a bare `git = …` floats on the default branch.
 - CI needs an SSH deploy key / token with read access to the repo.
 - When you later publish to a registry, consumers swap the `git = …` line for a
@@ -247,7 +247,7 @@ cargo run    # prints: bars processed: 0
 - **Safety:** the library is `#![forbid(unsafe_code)]` workspace-wide.
 - **Semver (important at 0.x):** while akadro is `0.y`, Cargo treats a **minor**
   bump (`0.1` → `0.2`) as **allowed to break**. For internal stability, pin
-  precisely — `akadro = "=0.1.1"`, or a git `tag`/`rev` — and adopt new minors
+  precisely — `akadro = "=0.1.2"`, or a git `tag`/`rev` — and adopt new minors
   deliberately. The public API is additively future-proofed (`#[non_exhaustive]`
   enums/structs), but 0.x makes no compatibility *promise* yet.
 - **Determinism & parity:** the same strategy source runs bit-identically in

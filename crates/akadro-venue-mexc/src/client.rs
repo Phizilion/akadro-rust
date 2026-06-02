@@ -606,6 +606,14 @@ impl<T: Transport> ExecutionClient for MexcSpotExec<T> {
         }
         self.pending = still;
     }
+
+    fn sync_clock(&mut self, wall_ms: i64) {
+        // The live shell drives the signing clock through this seam (m4). Equivalent
+        // to `set_clock_ms`, but reachable generically through the trait — including
+        // when this client is wrapped by `ChannelExec`. `sync_time` still layers the
+        // server offset on top via `time_offset_ms`.
+        self.clock_ms = wall_ms;
+    }
 }
 
 impl<T> fmt::Debug for MexcSpotExec<T> {
@@ -666,6 +674,27 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn sync_clock_sets_the_signing_timestamp() {
+        // m4: the ExecutionClient::sync_clock seam drives the signing clock (reachable
+        // generically, e.g. through ChannelExec), so a submitted order signs with it.
+        use akadro_core::ExecutionClient as _;
+        let mut x = exec(vec![HttpResponse::ok(ACK)]);
+        x.sync_clock(1_700_000_009_000);
+        let mut s: Vec<AccountEvent> = Vec::new();
+        x.submit(
+            ClientOrderId::new(0),
+            OrderRequest::market(I, Side::Buy, Qty::from_raw(100)),
+            now(),
+            &mut s,
+        );
+        let url = x.transport.last_url().unwrap();
+        assert!(
+            url.contains("timestamp=1700000009000"),
+            "order signs with the sync_clock-set timestamp, url={url}"
+        );
     }
 
     #[test]

@@ -66,12 +66,16 @@ impl Indicator for Bollinger {
         let n = i128::from(self.window as i64);
         let mid = (self.sum / n) as i64;
         // Population variance with an i128 accumulator. Widen BEFORE subtracting so
-        // `x - mid` cannot wrap in i64 (m31).
+        // `x - mid` cannot wrap in i64; saturate the square and the sum so an extreme
+        // i64 input (deviation² can exceed i128::MAX) can't overflow either (m31).
         let var: i128 = self
             .buf
             .iter()
-            .map(|&x| (i128::from(x) - i128::from(mid)).pow(2))
-            .sum::<i128>()
+            .map(|&x| {
+                let d = i128::from(x) - i128::from(mid);
+                d.saturating_mul(d)
+            })
+            .fold(0i128, i128::saturating_add)
             / n;
         let sd = (var as u128).isqrt() as i64;
         // Widen the band half-width and saturate so a huge k·σ can't wrap (m31).

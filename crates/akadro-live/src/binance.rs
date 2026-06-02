@@ -11,7 +11,7 @@
 //! synchronous engine over std channels — tokio types never escape this module.
 //!
 //! * [`spawn_klines`] streams **closed** bars into a lossless-or-fail
-//!   [`BoundedBridge`](crate::BoundedBridge) (the engine's `DataSource`). Wrap it
+//!   [`BoundedBridge`] (the engine's `DataSource`). Wrap it
 //!   in [`ReconnectingFeed`](crate::ReconnectingFeed) for auto-reconnect.
 //! * [`spawn_user_data`] streams `executionReport` fills/acks as
 //!   [`AccountEvent`]s into a channel for a [`ChannelExec`](crate::ChannelExec)
@@ -114,6 +114,16 @@ async fn run_klines(url: String, spec: KlineStream, tx: BridgeSender) {
 /// [`ChannelExec::new`](crate::ChannelExec::new). Reports for symbols not in
 /// `symbols`, or orders not tagged by this connector, are ignored. The producer
 /// ends (and the receiver closes) when the socket closes.
+///
+/// # listenKey keepalive (caller's responsibility)
+/// Binance expires a `listenKey` ~60 minutes after creation unless it is renewed.
+/// This function only *reads* the socket; it does **not** keep the key alive. For a
+/// session that runs longer than an hour the caller MUST `PUT /api/v3/userDataStream`
+/// (spot) / the futures equivalent on a timer — Binance recommends roughly every
+/// 30 minutes — using the signed REST client. Without that the stream silently
+/// closes mid-run and the receiver ends, so the engine simply stops seeing fills;
+/// pair this with [`ReconnectingFeed`](crate::ReconnectingFeed) on the market-data
+/// side and a fresh `listen_key` on reconnect.
 #[must_use]
 pub fn spawn_user_data(
     ws_base: &str,

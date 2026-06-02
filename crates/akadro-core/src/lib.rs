@@ -27,20 +27,26 @@
 //! context's constructor to be unreachable from any other crate (see the
 //! `AGENTS.md` "kill feature" section, decision D1).
 
+mod bar_order;
+mod decimal;
 mod error;
 mod event;
 mod fixed;
+mod funding;
 mod ids;
 mod instrument;
 mod order;
 mod traits;
 
+pub use bar_order::{BarOrderError, check_bars_ordered};
+pub use decimal::{decimal_to_raw, raw_to_decimal, scale_of};
 pub use error::{AkadroError, Result};
 pub use event::{
     AccountEvent, Bar, CancelReason, CancelRejectReason, Cost, CostKind, Costs, Event,
     RejectReason, signal_channel,
 };
 pub use fixed::{FUNDING_RATE_SCALE, Money, Price, Qty};
+pub use funding::{DEFAULT_FUNDING_PERIOD_MS, infer_funding_period_ms};
 pub use ids::{AssetId, ClientOrderId, InstrumentId, Timestamp, VenueId};
 pub use instrument::{CapSet, Capability, InstrumentKind, InstrumentSpec, RoundingRule};
 pub use order::{

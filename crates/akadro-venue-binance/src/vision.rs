@@ -260,9 +260,8 @@ impl VisionBarSource {
 
     // No raw-`Bar` hand-injection constructor: a venue connector must not be a data
     // leakage point — data enters only through the parse path (`from_csv`/`from_csvs`),
-    // per D18 (library-owns-data). To replay an arbitrary `Vec<Bar>`, use
-    // `akadro_backtest::HistoricalFeed::from_bars` (the blessed replay primitive for
-    // cache-/connector-sourced bars).
+    // per D18 (library-owns-data). `VisionBarSource` is itself a `DataSource`, so it
+    // drives the engine directly; the cache analog is `akadro_data::load_or_cache_feed`.
 }
 
 impl DataSource for VisionBarSource {

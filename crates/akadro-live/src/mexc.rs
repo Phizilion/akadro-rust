@@ -11,9 +11,9 @@
 //! and hands results to the synchronous engine over std channels.
 //!
 //! MEXC needs an explicit JSON **subscribe** handshake and a periodic **PING**
-//! (both built by [`akadro_venue_mexc::ws`]); the market/user-data payloads then
-//! arrive as binary protobuf. A kline push reports the in-progress window, so
-//! [`spawn_klines`] runs it through a [`KlineAggregator`](akadro_venue_mexc::KlineAggregator)
+//! (both built by the venue crate's `ws` helpers); the market/user-data payloads
+//! then arrive as binary protobuf. A kline push reports the in-progress window, so
+//! [`spawn_klines`] runs it through a [`KlineAggregator`]
 //! to surface only **closed** bars (parity-safe).
 
 use std::sync::mpsc::{Receiver, Sender, channel};

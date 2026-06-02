@@ -500,9 +500,12 @@ impl SimulatedExchange {
             let exec = if taker {
                 let after_slip = self.slipped(p, Side::Buy);
                 // Worst case: participation = 100%, so impact = price·impact_bps/1e4.
-                let impact = (i128::from(after_slip.raw())
-                    * i128::from(self.config.impact_bps.max(0))
-                    / 10_000) as i64;
+                // Clamp (not truncate) the i128 product back into i64 (m9).
+                let impact = i64::try_from(
+                    i128::from(after_slip.raw()) * i128::from(self.config.impact_bps.max(0))
+                        / 10_000,
+                )
+                .unwrap_or(i64::MAX);
                 Price::from_raw(after_slip.raw().saturating_add(impact)) // buy: adverse = higher
             } else {
                 p
@@ -517,8 +520,12 @@ impl SimulatedExchange {
         if self.config.slippage_bps == 0 {
             return base;
         }
-        let adj = (i128::from(base.raw()) * i128::from(self.config.slippage_bps) / 10_000) as i64;
-        Price::from_raw(base.raw() + side.sign() * adj)
+        // Clamp the i128 product into i64 rather than truncate (m10), and saturate the
+        // final adjustment so an extreme price/bps can't overflow.
+        let adj =
+            i64::try_from(i128::from(base.raw()) * i128::from(self.config.slippage_bps) / 10_000)
+                .unwrap_or(i64::MAX);
+        Price::from_raw(base.raw().saturating_add(side.sign().saturating_mul(adj)))
     }
 
     /// Fill price for a liquidity-taking order: flat [`slipped`](Self::slipped)
@@ -535,10 +542,18 @@ impl SimulatedExchange {
         let participation_bps =
             ((i128::from(fill_qty) * 10_000) / i128::from(bar_volume)).min(10_000);
         // impact = price · impact_bps/1e4 · participation/1e4, adverse to `side`.
-        let impact = (i128::from(after_slip.raw()) * i128::from(self.config.impact_bps) / 10_000
-            * participation_bps
-            / 10_000) as i64;
-        Price::from_raw(after_slip.raw() + side.sign() * impact)
+        // Clamp (not truncate) into i64 and saturate the final adjustment (m11).
+        let impact = i64::try_from(
+            i128::from(after_slip.raw()) * i128::from(self.config.impact_bps) / 10_000
+                * participation_bps
+                / 10_000,
+        )
+        .unwrap_or(i64::MAX);
+        Price::from_raw(
+            after_slip
+                .raw()
+                .saturating_add(side.sign().saturating_mul(impact)),
+        )
     }
 
     /// `true` if the probabilistic maker model is enabled AND this passive-limit
@@ -689,25 +704,42 @@ impl SimulatedExchange {
         }
     }
 
-    /// Cancel all other resting orders sharing `group`, emitting cancels.
-    fn cancel_oco_siblings(
+    /// Resolve the siblings of a claimed OCO `group` against the keeper's progress.
+    ///
+    /// If the keeper's fill was `keeper_complete` the protected position is closed, so
+    /// every other resting leg is canceled. On a *partial* keeper fill only the filled
+    /// portion is closed, so each sibling is reduced to the keeper's remainder (its
+    /// `filled` advanced to `keeper_filled`, keeping it resting) — a partial
+    /// take-profit no longer strips the protective stop for the still-open balance. A
+    /// sibling left with nothing to protect (qty fully covered by the keeper) is
+    /// canceled.
+    fn reduce_or_cancel_oco_siblings(
         &mut self,
         group: u32,
         keep: ClientOrderId,
+        keeper_filled: i64,
+        keeper_complete: bool,
         now: Timestamp,
         sink: &mut dyn EventSink,
     ) {
         let mut kept = Vec::with_capacity(self.resting.len());
-        for r in std::mem::take(&mut self.resting) {
+        for mut r in std::mem::take(&mut self.resting) {
             if r.order.oco_group == Some(group) && r.id != keep {
-                sink.emit(AccountEvent::OrderCanceled {
-                    id: r.id,
-                    reason: CancelReason::OcoTriggered,
-                    ts: now,
-                });
-            } else {
-                kept.push(r);
+                if keeper_complete || r.order.qty.raw().saturating_sub(keeper_filled) <= 0 {
+                    sink.emit(AccountEvent::OrderCanceled {
+                        id: r.id,
+                        reason: CancelReason::OcoTriggered,
+                        ts: now,
+                    });
+                    continue;
+                }
+                // Shrink the sibling to the keeper's unfilled remainder; it keeps
+                // resting to protect the still-open portion. `max` is defensive: a
+                // sibling never fills while the group is claimed, so its own `filled`
+                // is ≤ the keeper's, but never regress it.
+                r.filled = r.filled.max(keeper_filled);
             }
+            kept.push(r);
         }
         self.resting = kept;
     }
@@ -942,18 +974,25 @@ impl ExecutionClient for SimulatedExchange {
         // bar's resting orders for this instrument: it depletes as orders fill, so
         // N orders cannot each take the full bar volume (the bar is one instrument,
         // so a single running counter suffices).
-        let mut cap = self
-            .config
-            .max_participation_bps
-            .map(|bps| (i128::from(bar.volume.raw()) * i128::from(bps) / 10_000) as i64);
+        let mut cap = self.config.max_participation_bps.map(|bps| {
+            // Clamp the i128 product into i64 (preserving sign) rather than truncate —
+            // a huge bar volume or bps shouldn't wrap the cap (m40). A negative cap is
+            // floored to 0 at the fill site below.
+            (i128::from(bar.volume.raw()) * i128::from(bps) / 10_000)
+                .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+        });
 
         // Collect fills (id, instrument, side, price, qty, completes_order) + OCO
         // groups to apply after the borrow ends.
         let mut to_fill: Vec<(ClientOrderId, InstrumentId, Side, Price, Qty, bool)> = Vec::new();
         // OCO groups that have taken liquidity this bar, with the keeper id. A
         // group is claimed on its FIRST fill (partial or full); any other leg of a
-        // claimed group is canceled (one-cancels-other) instead of also filling.
-        let mut claimed_oco: Vec<(u32, ClientOrderId)> = Vec::new();
+        // claimed group cannot also take liquidity this bar (one-cancels-other, no
+        // intra-bar double-exec). On a *partial* keeper fill the siblings are reduced
+        // to the keeper's remainder rather than cancelled (so a partial take-profit
+        // doesn't strip the stop for the rest of the position); on a *complete* fill
+        // they are cancelled. Tuple: (group, keeper, keeper_filled, keeper_complete).
+        let mut claimed_oco: Vec<(u32, ClientOrderId, i64, bool)> = Vec::new();
 
         // The position as fills are *staged* this bar, so reduce-only caps account
         // for siblings already filled in this same loop (M11). Seeded from the
@@ -976,21 +1015,14 @@ impl ExecutionClient for SimulatedExchange {
             }
 
             // Every conditional order surfaces exactly one OrderTriggered when its
-            // condition is first met: a stop-limit arms (set inside `evaluate`)
-            // before working as a limit; a stop / market-if-touched / trailing-stop
-            // triggers on its first fill (we arm it here so a partial-fill remainder
-            // does not re-trigger). `r.armed` is the "already triggered" flag.
+            // condition is first met. A stop-limit arms (set inside `evaluate`) before
+            // working as a limit, so its trigger surfaces here. A stop /
+            // market-if-touched / trailing-stop instead triggers on its first fill —
+            // emitted in the Fill arm below, AFTER the OCO check, so a leg canceled by
+            // its OCO sibling does not emit a spurious trigger (m12). `r.armed` is the
+            // "already triggered" flag.
             let was_armed = r.armed;
             let outcome = Self::evaluate(&mut r, bar);
-            let conditional_fill = matches!(
-                r.order.kind,
-                OrderKind::Stop { .. }
-                    | OrderKind::MarketIfTouched { .. }
-                    | OrderKind::TrailingStop { .. }
-            ) && matches!(outcome, Outcome::Fill(_));
-            if conditional_fill {
-                r.armed = true;
-            }
             if !was_armed && r.armed {
                 sink.emit(AccountEvent::OrderTriggered { id: r.id, ts: now });
             }
@@ -1003,10 +1035,22 @@ impl ExecutionClient for SimulatedExchange {
                     });
                 }
                 Outcome::Rest => {
-                    if r.order.tif == TimeInForce::Gtc {
+                    // A not-yet-triggered conditional (stop / stop-limit / MIT /
+                    // trailing, before its trigger fires) keeps resting regardless of
+                    // TIF — TIF only governs once the order is *actionable*. A limit
+                    // (always actionable: it could have crossed this bar) or an
+                    // already-armed conditional that couldn't act expires per IOC/FOK.
+                    let dormant_conditional = !r.armed
+                        && matches!(
+                            r.order.kind,
+                            OrderKind::Stop { .. }
+                                | OrderKind::StopLimit { .. }
+                                | OrderKind::MarketIfTouched { .. }
+                                | OrderKind::TrailingStop { .. }
+                        );
+                    if r.order.tif == TimeInForce::Gtc || dormant_conditional {
                         self.resting.push(r);
                     } else {
-                        // IOC/FOK that could not act this bar expires per its TIF.
                         sink.emit(AccountEvent::OrderExpired { id: r.id, ts: now });
                     }
                 }
@@ -1028,7 +1072,9 @@ impl ExecutionClient for SimulatedExchange {
                     // bar, this leg is canceled, not filled — so a single wide bar
                     // cannot execute both legs of a bracket.
                     if let Some(g) = r.order.oco_group
-                        && claimed_oco.iter().any(|(cg, cid)| *cg == g && *cid != r.id)
+                        && claimed_oco
+                            .iter()
+                            .any(|(cg, cid, _, _)| *cg == g && *cid != r.id)
                     {
                         sink.emit(AccountEvent::OrderCanceled {
                             id: r.id,
@@ -1036,6 +1082,21 @@ impl ExecutionClient for SimulatedExchange {
                             ts: now,
                         });
                         continue;
+                    }
+                    // Stop / MIT / trailing-stop trigger on their first fill (arm here
+                    // so a partial-fill remainder does not re-trigger). Emitted only now
+                    // that the leg has cleared the maker-touch and OCO checks, so a
+                    // canceled OCO leg never emits a spurious OrderTriggered (m12).
+                    if !r.armed
+                        && matches!(
+                            r.order.kind,
+                            OrderKind::Stop { .. }
+                                | OrderKind::MarketIfTouched { .. }
+                                | OrderKind::TrailingStop { .. }
+                        )
+                    {
+                        r.armed = true;
+                        sink.emit(AccountEvent::OrderTriggered { id: r.id, ts: now });
                     }
                     let remaining = r.order.qty.raw() - r.filled;
                     let mut want = cap.map_or(remaining, |c| remaining.min(c.max(0)));
@@ -1109,12 +1170,13 @@ impl ExecutionClient for SimulatedExchange {
                     if let Some(c) = cap.as_mut() {
                         *c -= want;
                     }
-                    // Claim the OCO group on this (first) fill so siblings — whether
-                    // they fill later in this loop or merely rest — are canceled.
+                    // Claim the OCO group on this (first) fill, recording the keeper's
+                    // cumulative filled qty and whether it completed, so siblings are
+                    // reduced (partial) or canceled (complete) after the loop.
                     if let Some(g) = r.order.oco_group
-                        && !claimed_oco.iter().any(|(cg, _)| *cg == g)
+                        && !claimed_oco.iter().any(|(cg, ..)| *cg == g)
                     {
-                        claimed_oco.push((g, r.id));
+                        claimed_oco.push((g, r.id, r.filled, complete));
                     }
 
                     if !complete {
@@ -1149,10 +1211,18 @@ impl ExecutionClient for SimulatedExchange {
             });
         }
 
-        // OCO sibling cancels: any leg of a claimed group still resting is canceled
-        // (the keeper is the leg that took liquidity this bar).
-        for (group, keep) in claimed_oco {
-            self.cancel_oco_siblings(group, keep, now, sink);
+        // OCO resolution: cancel resting siblings of a completed keeper, or reduce
+        // them to the keeper's unfilled remainder on a partial fill (the keeper is the
+        // leg that took liquidity this bar).
+        for (group, keep, keeper_filled, keeper_complete) in claimed_oco {
+            self.reduce_or_cancel_oco_siblings(
+                group,
+                keep,
+                keeper_filled,
+                keeper_complete,
+                now,
+                sink,
+            );
         }
 
         self.accrue_funding(bar, now, sink);
@@ -1544,6 +1614,183 @@ mod tests {
             }
         )));
         assert_eq!(x.resting_count(), 0);
+    }
+
+    #[test]
+    fn oco_partial_keeper_fill_reduces_sibling_not_cancels_it() {
+        // m2: a partial take-profit fill must NOT strip the protective stop for the
+        // still-open balance. Bracket qty 10 (TP sell limit @110, SL sell stop @90),
+        // 50% participation cap. Bar 1 reaches only the TP (high 112, low 104) so it
+        // fills 5 (cap) — a PARTIAL keeper fill; the stop must keep resting, reduced
+        // to the 5 remainder. Bar 2 gaps down and triggers the stop, which fills its
+        // reduced remainder (5), not the full 10 — proving it was scaled, not left
+        // whole and not stripped.
+        let mut x = SimulatedExchange::new(vec![spec()], 0).with_participation_bps(5_000);
+        let mut s = Vec::new();
+        x.submit(
+            ClientOrderId::new(0),
+            OrderRequest::limit(I, Side::Sell, Qty::from_raw(10), Price::from_raw(110)).oco(7),
+            Timestamp::from_nanos(1),
+            &mut s,
+        );
+        x.submit(
+            ClientOrderId::new(1),
+            OrderRequest::stop(
+                I,
+                Side::Sell,
+                Qty::from_raw(10),
+                Price::from_raw(90),
+                TriggerBy::Last,
+            )
+            .oco(7),
+            Timestamp::from_nanos(1),
+            &mut s,
+        );
+        s.clear();
+        // Bar 1: only the TP is reachable; cap limits it to a partial 5.
+        x.observe(
+            &bar(105, 112, 104, 110, 10),
+            Timestamp::from_nanos(2),
+            &mut s,
+        );
+        assert_eq!(
+            fills(&s),
+            vec![(Price::from_raw(110), Qty::from_raw(5), Side::Sell)],
+            "TP fills the 50% cap (5), a partial keeper fill"
+        );
+        assert!(
+            !s.iter()
+                .any(|e| matches!(e, AccountEvent::OrderCanceled { .. })),
+            "a partial keeper fill must NOT cancel the protective sibling"
+        );
+        assert_eq!(
+            x.resting_count(),
+            2,
+            "both legs still rest after a partial fill"
+        );
+        // Bar 2: gap down triggers the stop (large volume, no cap). It fills only its
+        // reduced remainder (5), then completes and cancels the TP sibling.
+        s.clear();
+        x.observe(
+            &bar(104, 106, 85, 88, 1_000),
+            Timestamp::from_nanos(3),
+            &mut s,
+        );
+        assert_eq!(
+            fills(&s),
+            vec![(Price::from_raw(90), Qty::from_raw(5), Side::Sell)],
+            "stop fills the reduced remainder (5), not the full 10"
+        );
+        assert!(
+            s.iter().any(|e| matches!(
+                e,
+                AccountEvent::OrderCanceled {
+                    reason: CancelReason::OcoTriggered,
+                    ..
+                }
+            )),
+            "a now-complete keeper cancels the resting sibling"
+        );
+        assert_eq!(x.resting_count(), 0);
+    }
+
+    #[test]
+    fn ioc_dormant_conditional_keeps_resting_then_fires() {
+        // m1: TIF governs an order only once it is *actionable*. An IOC stop whose
+        // trigger has not fired is dormant and must keep resting (a bare
+        // "Gtc ? rest : expire" wrongly expired it on the first quiet bar). It fires
+        // on a later bar that reaches the trigger.
+        let mut x = SimulatedExchange::new(vec![spec()], 0);
+        let mut s = Vec::new();
+        x.submit(
+            ClientOrderId::new(0),
+            OrderRequest::stop(
+                I,
+                Side::Sell,
+                Qty::from_raw(1),
+                Price::from_raw(90),
+                TriggerBy::Last,
+            )
+            .with_tif(TimeInForce::Ioc),
+            Timestamp::from_nanos(1),
+            &mut s,
+        );
+        s.clear();
+        // Quiet bar above the trigger: the stop is dormant, must keep resting.
+        x.observe(
+            &bar(100, 101, 95, 100, 10),
+            Timestamp::from_nanos(2),
+            &mut s,
+        );
+        assert!(
+            !s.iter()
+                .any(|e| matches!(e, AccountEvent::OrderExpired { .. })),
+            "a dormant IOC conditional must not expire"
+        );
+        assert_eq!(x.resting_count(), 1);
+        // Bar reaches the trigger: it fires and fills.
+        s.clear();
+        x.observe(&bar(95, 96, 85, 88, 10), Timestamp::from_nanos(3), &mut s);
+        assert_eq!(
+            fills(&s).len(),
+            1,
+            "the stop fires once its trigger is reached"
+        );
+        assert!(
+            s.iter()
+                .any(|e| matches!(e, AccountEvent::OrderTriggered { .. }))
+        );
+    }
+
+    #[test]
+    fn oco_canceled_leg_emits_no_spurious_trigger() {
+        // m12: when one OCO leg takes liquidity, a sibling stop that *would* have
+        // filled on the same bar is OCO-canceled — it must NOT emit a spurious
+        // OrderTriggered before the cancel. Wide bar fills the TP limit first
+        // (submitted first wins); the SL stop is canceled, with no trigger event.
+        let mut x = SimulatedExchange::new(vec![spec()], 0);
+        let mut s = Vec::new();
+        x.submit(
+            ClientOrderId::new(0),
+            OrderRequest::limit(I, Side::Sell, Qty::from_raw(1), Price::from_raw(110)).oco(7),
+            Timestamp::from_nanos(1),
+            &mut s,
+        );
+        x.submit(
+            ClientOrderId::new(1),
+            OrderRequest::stop(
+                I,
+                Side::Sell,
+                Qty::from_raw(1),
+                Price::from_raw(90),
+                TriggerBy::Last,
+            )
+            .oco(7),
+            Timestamp::from_nanos(1),
+            &mut s,
+        );
+        s.clear();
+        x.observe(
+            &bar(100, 112, 88, 100, 10),
+            Timestamp::from_nanos(2),
+            &mut s,
+        );
+        assert!(
+            s.iter().any(|e| matches!(
+                e,
+                AccountEvent::OrderCanceled {
+                    id, reason: CancelReason::OcoTriggered, ..
+                } if *id == ClientOrderId::new(1)
+            )),
+            "the SL stop sibling is OCO-canceled"
+        );
+        assert!(
+            !s.iter().any(|e| matches!(
+                e,
+                AccountEvent::OrderTriggered { id, .. } if *id == ClientOrderId::new(1)
+            )),
+            "the canceled stop leg must not emit a spurious OrderTriggered (m12)"
+        );
     }
 
     #[test]

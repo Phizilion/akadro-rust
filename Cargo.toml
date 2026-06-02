@@ -27,7 +27,7 @@ members = [
 # true`, keeping version/MSRV/license consistent across the workspace.
 # ----------------------------------------------------------------------------
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.95"
 license = "MPL-2.0"
@@ -40,21 +40,21 @@ categories = ["finance", "simulation"]
 # builds standalone; external versions are pinned with caret ranges.
 # ----------------------------------------------------------------------------
 [workspace.dependencies]
-akadro-core = { version = "0.1.1", path = "crates/akadro-core" }
-akadro-engine = { version = "0.1.1", path = "crates/akadro-engine" }
-akadro-backtest = { version = "0.1.1", path = "crates/akadro-backtest" }
-akadro-testkit = { version = "0.1.1", path = "crates/akadro-testkit" }
-akadro-indicators = { version = "0.1.1", path = "crates/akadro-indicators" }
-akadro-analytics = { version = "0.1.1", path = "crates/akadro-analytics" }
-akadro-data = { version = "0.1.1", path = "crates/akadro-data" }
-akadro-venue-dex = { version = "0.1.1", path = "crates/akadro-venue-dex" }
-akadro-venue-binance = { version = "0.1.1", path = "crates/akadro-venue-binance" }
-akadro-venue-mexc = { version = "0.1.1", path = "crates/akadro-venue-mexc" }
-akadro-venue-okx = { version = "0.1.1", path = "crates/akadro-venue-okx" }
-akadro-venue-bybit = { version = "0.1.1", path = "crates/akadro-venue-bybit" }
-akadro-venue-kucoin = { version = "0.1.1", path = "crates/akadro-venue-kucoin" }
-akadro-live = { version = "0.1.1", path = "crates/akadro-live" }
-sma-crossover = { version = "0.1.1", path = "crates/sma-crossover" }
+akadro-core = { version = "0.1.2", path = "crates/akadro-core" }
+akadro-engine = { version = "0.1.2", path = "crates/akadro-engine" }
+akadro-backtest = { version = "0.1.2", path = "crates/akadro-backtest" }
+akadro-testkit = { version = "0.1.2", path = "crates/akadro-testkit" }
+akadro-indicators = { version = "0.1.2", path = "crates/akadro-indicators" }
+akadro-analytics = { version = "0.1.2", path = "crates/akadro-analytics" }
+akadro-data = { version = "0.1.2", path = "crates/akadro-data" }
+akadro-venue-dex = { version = "0.1.2", path = "crates/akadro-venue-dex" }
+akadro-venue-binance = { version = "0.1.2", path = "crates/akadro-venue-binance" }
+akadro-venue-mexc = { version = "0.1.2", path = "crates/akadro-venue-mexc" }
+akadro-venue-okx = { version = "0.1.2", path = "crates/akadro-venue-okx" }
+akadro-venue-bybit = { version = "0.1.2", path = "crates/akadro-venue-bybit" }
+akadro-venue-kucoin = { version = "0.1.2", path = "crates/akadro-venue-kucoin" }
+akadro-live = { version = "0.1.2", path = "crates/akadro-live" }
+sma-crossover = { version = "0.1.2", path = "crates/sma-crossover" }
 
 thiserror = "2.0"
 smallvec = "1.13"

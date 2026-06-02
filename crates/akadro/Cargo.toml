@@ -20,7 +20,9 @@ akadro-data = { workspace = true, optional = true }
 akadro-live = { workspace = true, optional = true }
 
 [dev-dependencies]
-akadro-backtest.workspace = true
+# `import-bars` so the umbrella's own integration tests + doctests may build synthetic
+# bars via HistoricalFeed::from_bars; downstream consumers do NOT get it by default.
+akadro-backtest = { workspace = true, features = ["import-bars"] }
 akadro-testkit.workspace = true
 akadro-analytics.workspace = true
 sma-crossover.workspace = true
@@ -36,6 +38,15 @@ testkit = ["dep:akadro-testkit"]
 indicators = ["dep:akadro-indicators"]
 # Performance/risk analytics over backtest results.
 analytics = ["dep:akadro-analytics"]
+# Opt-in: expose the low-level generic walk-forward fold runners that can leak IS/OOS
+# (off by default; the safe WalkForwardBacktest is always available). Advanced use only.
+escape-hatch = ["analytics", "akadro-analytics/escape-hatch"]
+# Opt-in: re-expose the casual raw-`Vec<Bar>`/`Vec<Event>` feed constructors
+# (`HistoricalFeed::{new, from_bars, try_from_bars}`) — the D18 data-injection door,
+# off by default. The blessed path is `data`'s `load_or_cache_feed` / a connector feed;
+# to supply your own data, implement `DataSource`. Kept SEPARATE from `escape-hatch`
+# (different footgun: raw data injection ≠ IS/OOS leak).
+import-bars = ["backtest", "akadro-backtest/import-bars"]
 # Columnar on-disk market-data cache.
 data = ["dep:akadro-data"]
 # Live trading shell: auto-reconnect feeds + paper trading.

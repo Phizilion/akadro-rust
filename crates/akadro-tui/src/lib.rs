@@ -382,15 +382,15 @@ mod tests {
     use akadro_core::{ClientOrderId, InstrumentId, Price, Qty, Timestamp};
 
     fn fill(ts: i64, side: Side, price: i64, qty: i64) -> FillRecord {
-        FillRecord {
-            id: ClientOrderId::new(0),
-            instrument: InstrumentId::new(0),
+        FillRecord::new(
+            ClientOrderId::new(0),
+            InstrumentId::new(0),
             side,
-            price: Price::from_raw(price),
-            qty: Qty::from_raw(qty),
-            fee: Money::ZERO,
-            ts: Timestamp::from_nanos(ts),
-        }
+            Price::from_raw(price),
+            Qty::from_raw(qty),
+            Money::ZERO,
+            Timestamp::from_nanos(ts),
+        )
     }
 
     #[test]

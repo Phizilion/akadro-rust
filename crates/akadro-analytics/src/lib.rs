@@ -21,6 +21,7 @@ mod grid;
 mod trades;
 mod walk_forward;
 
+pub use akadro_core::{BarOrderError, check_bars_ordered};
 pub use cross_section::{information_coefficient, information_ratio, rank_information_coefficient};
 pub use distribution::{
     DistributionStats, cvar, deflated_sharpe, expected_max_sharpe_z, kurtosis, norm_cdf, norm_ppf,
@@ -29,10 +30,16 @@ pub use distribution::{
 };
 pub use equity::{
     PERIODS_PER_YEAR_CRYPTO_1M, PERIODS_PER_YEAR_CRYPTO_DAILY, PERIODS_PER_YEAR_EQUITY_DAILY,
-    PerformanceReport,
+    PerformanceReport, infer_periods_per_year,
 };
 pub use grid::{combinatorial_splits, run_grid};
 pub use trades::TradeStats;
 pub use walk_forward::{
-    Window, run_walk_forward, walk_forward, walk_forward_anchored, walk_forward_purged,
+    WalkForwardSummary, Window, slice_window, walk_forward, walk_forward_anchored,
+    walk_forward_purged,
 };
+// The generic fold runners hand a closure both train AND test — an IS/OOS leakage
+// footgun — so they live behind the off-by-default `escape-hatch` feature, not the
+// default user surface (which offers only the structurally-safe WalkForwardBacktest).
+#[cfg(feature = "escape-hatch")]
+pub use walk_forward::{run_walk_forward, run_walk_forward_checked};

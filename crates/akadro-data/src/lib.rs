@@ -28,8 +28,9 @@ mod signal;
 mod trades;
 
 pub use bars::{
-    BarSpec, DataError, FeatherBarSource, LoadedBars, cache_from_source, load_or_cache,
-    load_or_cache_many, read_partition, write_partition,
+    BarSpec, CachedFeed, DataError, FeatherBarSource, LoadedBars, cache_from_source, load_or_cache,
+    load_or_cache_feed, load_or_cache_many, load_or_cache_many_feed, read_partition,
+    write_partition,
 };
 pub use manifest::{CacheEntry, Manifest};
 pub use merge::MergeSource;

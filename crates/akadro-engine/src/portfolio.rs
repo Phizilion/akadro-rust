@@ -12,9 +12,12 @@
 
 use akadro_core::{AccountEvent, ClientOrderId, Cost, InstrumentId, Money, Price, Qty, Side};
 
-/// One recorded fill (the unit the parity golden-master compares).
+/// One recorded fill (the unit the parity golden-master compares). Construct via
+/// [`FillRecord::new`]; `#[non_exhaustive]` so fields can be added (with
+/// `#[serde(default)]`) without breaking previously-saved reports or downstream code.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub struct FillRecord {
     /// Order that produced this fill.
     pub id: ClientOrderId,
@@ -30,6 +33,30 @@ pub struct FillRecord {
     pub fee: Money,
     /// Event time of the fill.
     pub ts: akadro_core::Timestamp,
+}
+
+impl FillRecord {
+    /// Construct a fill record.
+    #[must_use]
+    pub fn new(
+        id: ClientOrderId,
+        instrument: InstrumentId,
+        side: Side,
+        price: Price,
+        qty: Qty,
+        fee: Money,
+        ts: akadro_core::Timestamp,
+    ) -> Self {
+        FillRecord {
+            id,
+            instrument,
+            side,
+            price,
+            qty,
+            fee,
+            ts,
+        }
+    }
 }
 
 /// Net position in one instrument: signed quantity and average entry price.

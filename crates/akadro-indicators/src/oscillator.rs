@@ -16,8 +16,8 @@ pub struct Rsi {
     prev: Option<i64>,
     avg_gain: i64,
     avg_loss: i64,
-    seed_gain: i64,
-    seed_loss: i64,
+    seed_gain: i128,
+    seed_loss: i128,
     count: usize,
     seeded: bool,
 }
@@ -62,7 +62,9 @@ impl Indicator for Rsi {
             self.prev = Some(input);
             return None;
         };
-        let delta = input - prev;
+        // Widen the first difference so an extreme price pair cannot overflow i64,
+        // and accumulate the seed in i128 to match the Wilder path (m31).
+        let delta = i128::from(input) - i128::from(prev);
         self.prev = Some(input);
         let (gain, loss) = if delta >= 0 { (delta, 0) } else { (0, -delta) };
 
@@ -71,9 +73,9 @@ impl Indicator for Rsi {
             self.seed_loss += loss;
             self.count += 1;
             if self.count == self.period {
-                let p = self.period as i64;
-                self.avg_gain = self.seed_gain / p;
-                self.avg_loss = self.seed_loss / p;
+                let p = i128::from(self.period as i64);
+                self.avg_gain = i64::try_from(self.seed_gain / p).unwrap_or(i64::MAX);
+                self.avg_loss = i64::try_from(self.seed_loss / p).unwrap_or(i64::MAX);
                 self.seeded = true;
                 return Some(self.level());
             }
@@ -82,8 +84,8 @@ impl Indicator for Rsi {
 
         // Wilder smoothing, widened so `avg * (p-1)` cannot overflow i64 (m31).
         let p = i128::from(self.period as i64);
-        self.avg_gain = ((i128::from(self.avg_gain) * (p - 1) + i128::from(gain)) / p) as i64;
-        self.avg_loss = ((i128::from(self.avg_loss) * (p - 1) + i128::from(loss)) / p) as i64;
+        self.avg_gain = ((i128::from(self.avg_gain) * (p - 1) + gain) / p) as i64;
+        self.avg_loss = ((i128::from(self.avg_loss) * (p - 1) + loss) / p) as i64;
         Some(self.level())
     }
 

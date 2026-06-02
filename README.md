@@ -6,7 +6,7 @@ guarantee against look-ahead, and strict backtest↔live parity.**
 [![license](https://img.shields.io/badge/license-MPL--2.0-blue)](#license)
 [![rust](https://img.shields.io/badge/rust-1.95%2B-orange)](#)
 
-> Status: **v0.1.1**, intended for use as a dependency in other
+> Status: **v0.1.2**, intended for use as a dependency in other
 > projects. The look-ahead kill feature, the backtest↔live parity golden-master,
 > **five REST venue connectors** (MEXC spot+futures, OKX, Binance, Bybit, KuCoin —
 > each with historical back-fill, rate-limit pacing, and paged funding history),

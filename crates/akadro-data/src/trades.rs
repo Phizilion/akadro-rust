@@ -14,8 +14,9 @@ use akadro_core::{Bar, InstrumentId, Price, Qty, Timestamp};
 /// Parse an interval string to **nanoseconds**, supporting sub-second through
 /// weekly: a positive integer followed by a unit — `ms`, `s`, `m` (minute), `h`,
 /// `d`, or `W`/`w`. Examples: `"100ms"`, `"500ms"`, `"1s"`, `"5s"`, `"1m"`,
-/// `"15m"`, `"4h"`, `"1d"`, `"1W"`. `None` on an empty number, an unknown unit,
-/// or overflow. (Note: lowercase `m` is *minute*; month is not supported here.)
+/// `"15m"`, `"4h"`, `"1d"`, `"1W"`. `None` on an empty or non-positive number
+/// (e.g. `"0s"`), an unknown unit, or overflow. (Note: lowercase `m` is *minute*;
+/// month is not supported here.)
 #[must_use]
 pub fn interval_to_nanos(interval: &str) -> Option<i64> {
     let s = interval.trim();
@@ -24,6 +25,9 @@ pub fn interval_to_nanos(interval: &str) -> Option<i64> {
         return None; // no numeric prefix
     }
     let num: i64 = s[..split].parse().ok()?;
+    if num <= 0 {
+        return None; // a zero/empty interval ("0s") is not a valid timeframe
+    }
     let unit_ns: i64 = match &s[split..] {
         "ms" => 1_000_000,
         "s" => 1_000_000_000,
@@ -52,6 +56,16 @@ pub fn bars_from_trades(
     if interval_ns <= 0 || trades.is_empty() {
         return Vec::new();
     }
+    // Single-pass bucketing assumes time-ordered prints (the documented contract,
+    // honoured by every connector that produces them). Out-of-order input would
+    // silently emit duplicate/misordered buckets; catch that in debug rather than
+    // pay an O(n log n) defensive sort on this aggregation hot path in release (m18).
+    debug_assert!(
+        trades
+            .windows(2)
+            .all(|w| w[0].0.as_nanos() <= w[1].0.as_nanos()),
+        "bars_from_trades requires time-ordered trade prints; got an out-of-order input"
+    );
     let mut bars = Vec::new();
     let mut bucket: Option<i64> = None;
     let (mut open, mut high, mut low, mut close) =
@@ -120,6 +134,8 @@ mod tests {
         assert_eq!(interval_to_nanos("5x"), None); // bad unit
         assert_eq!(interval_to_nanos(""), None);
         assert_eq!(interval_to_nanos("1y"), None);
+        assert_eq!(interval_to_nanos("0s"), None); // non-positive interval (m43)
+        assert_eq!(interval_to_nanos("0ms"), None);
     }
 
     #[test]

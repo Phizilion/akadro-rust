@@ -102,6 +102,18 @@ pub trait ExecutionClient {
         let _ = (command, now, sink);
     }
 
+    /// Synchronise this client's request-signing clock to the current wall-clock
+    /// `wall_ms` (epoch-milliseconds). The default is a no-op — a simulated venue
+    /// signs nothing, and event-time governs everything else (D5: no synchronous
+    /// venue query). A **live** connector overrides this so the shell can keep its
+    /// signed-request timestamp current and correct server-clock drift; otherwise a
+    /// backlog/reconnect makes every signed order sign with stale event-time and the
+    /// venue rejects it. It never affects account state, which still flows only
+    /// through emitted [`AccountEvent`]s.
+    fn sync_clock(&mut self, wall_ms: i64) {
+        let _ = wall_ms;
+    }
+
     /// The deterministic seed this client used, if any (e.g. a simulated venue's
     /// probabilistic-fill seed). Recorded in the run report so a run can be
     /// reproduced from the report alone. `None` for clients with no seeded model.

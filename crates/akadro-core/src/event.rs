@@ -159,8 +159,10 @@ pub enum CostKind {
     Funding,
 }
 
-/// One cost component of a fill.
+/// One cost component of a fill. Construct via [`Cost::new`]; `#[non_exhaustive]`
+/// so cost fields (e.g. a fee tier/rate per D17) can be added without a semver break.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub struct Cost {
     /// Asset the cost is denominated in.
     pub asset: AssetId,

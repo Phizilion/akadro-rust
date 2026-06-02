@@ -138,59 +138,19 @@ impl Transport for MockTransport {
 
 // --- fixed-point decimal helpers ---------------------------------------------
 
-/// Number of significant fractional digits in a decimal string (trailing zeros
-/// stripped): `"0.01"` → 2, `"1"` → 0.
-#[must_use]
-pub fn scale_of(decimal: &str) -> u32 {
-    match decimal.split_once('.') {
-        Some((_, frac)) => frac.trim_end_matches('0').len() as u32,
-        None => 0,
-    }
-}
+// `scale_of` and `raw_to_decimal` are venue-neutral and live in `akadro-core` (DRY),
+// re-exported here for this connector's public surface.
+pub use akadro_core::{raw_to_decimal, scale_of};
 
 /// Parse a decimal string to a raw fixed-point `i64` at `scale` (truncating excess
-/// precision).
+/// precision). Thin adapter over [`akadro_core::decimal_to_raw`] mapping a rejected
+/// value to this venue's error.
 ///
 /// # Errors
-/// [`BybitError::Parse`] if the digits are invalid.
+/// [`BybitError::Parse`] if `s` is empty, non-numeric, or overflows `i64`.
 pub fn decimal_to_raw(s: &str, scale: u32) -> Result<i64, BybitError> {
-    let neg = s.starts_with('-');
-    let s = s.trim_start_matches('-');
-    let (int_part, frac_part) = s.split_once('.').unwrap_or((s, ""));
-    let int_part = if int_part.is_empty() { "0" } else { int_part };
-    let mut frac = frac_part.to_string();
-    let scale_us = scale as usize;
-    frac.truncate(scale_us);
-    while frac.len() < scale_us {
-        frac.push('0');
-    }
-    let combined = format!("{int_part}{frac}");
-    let val: i64 = combined
-        .parse()
-        .map_err(|_| BybitError::Parse(format!("bad decimal {s:?}")))?;
-    Ok(if neg { -val } else { val })
-}
-
-/// Format a raw fixed-point `i64` at `scale` back to a decimal string.
-#[must_use]
-pub fn raw_to_decimal(raw: i64, scale: u32) -> String {
-    // Clamp to the largest base-10 exponent a u128 holds (bug class 3).
-    let scale = scale.min(38);
-    if scale == 0 {
-        return raw.to_string();
-    }
-    let neg = raw < 0;
-    let mag = raw.unsigned_abs();
-    let div = 10u128.pow(scale);
-    let int = (u128::from(mag) / div).to_string();
-    let frac = format!("{:0width$}", u128::from(mag) % div, width = scale as usize);
-    let frac = frac.trim_end_matches('0');
-    let s = if frac.is_empty() {
-        int
-    } else {
-        format!("{int}.{frac}")
-    };
-    if neg { format!("-{s}") } else { s }
+    akadro_core::decimal_to_raw(s, scale)
+        .ok_or_else(|| BybitError::Parse(format!("bad decimal {s:?} at scale {scale}")))
 }
 
 /// Milliseconds in a Bybit kline `interval` token: minutes as a number (`"1"`,
@@ -435,6 +395,13 @@ struct KlineResult {
 /// `[startTime, o, h, l, c, volume, turnover]` with `startTime` the window
 /// **open** time (ms); Bybit returns them newest-first, so they are sorted
 /// ascending and stamped at close time (`startTime + interval_millis`).
+///
+/// **Unclosed last candle.** The Bybit v5 REST kline carries no per-row "closed"
+/// flag (only the WS kline has `confirm`). When the requested range reaches the
+/// present, the first row Bybit returns (newest, sorted last here) is the still-
+/// forming candle, whose OHLCV keeps changing. This parser returns it as-is; for
+/// reproducible runs back-fill a window ending before the present, or drop a
+/// trailing bar whose `startTime + interval` exceeds server time.
 ///
 /// # Errors
 /// [`BybitError::Parse`] on bad JSON, a short row, or a bad number.
@@ -916,8 +883,12 @@ impl<T: Transport> BybitExec<T> {
         }
     }
 
-    /// Set the millisecond timestamp used for signing (the live transport derives
-    /// it from the system clock; tests set it for determinism).
+    /// Pin a **fixed** millisecond timestamp for request signing — intended for
+    /// deterministic tests. When left **unset** (the default), each request signs
+    /// with the handler's event time (`now`), which under a live event-time clock
+    /// tracks wall-clock; that is the correct live behaviour. Do **not** call this in
+    /// live: a pinned timestamp is reused verbatim for every request and soon falls
+    /// outside Bybit's `recv_window`, so signed orders start being rejected (m36).
     #[must_use]
     pub fn with_timestamp_ms(mut self, ms: i64) -> Self {
         self.timestamp_ms = ms.to_string();
@@ -995,8 +966,19 @@ impl<T: Transport> ExecutionClient for BybitExec<T> {
         // reduce-only is a derivatives concept: inject it on linear-perp orders
         // (bug class 2). On spot it is silently dropped (Bybit spot has no
         // reduce-only), matching the field's no-op there.
-        if order.reduce_only && m.category == Category::Linear {
-            body.insert_str(body.len() - 1, ",\"reduceOnly\":true");
+        if order.reduce_only {
+            if m.category == Category::Linear {
+                body.insert_str(body.len() - 1, ",\"reduceOnly\":true");
+            } else {
+                // Spot has no reduce-only; reject rather than silently send a
+                // position-increasing order — parity with OKX/KuCoin + the simulator.
+                sink.emit(AccountEvent::OrderRejected {
+                    id,
+                    reason: RejectReason::InvalidOrder,
+                    ts: now,
+                });
+                return;
+            }
         }
         // Signing timestamp: the test/driver-set value, or the handler's event time
         // when unset — never sign with an empty string (which Bybit rejects), and the

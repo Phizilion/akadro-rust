@@ -154,61 +154,19 @@ impl Transport for MockTransport {
 
 // --- fixed-point decimal helpers ---------------------------------------------
 
-/// Number of significant fractional digits in a decimal string (trailing zeros
-/// stripped): `"0.10"` → 1, `"1"` → 0.
-#[must_use]
-pub fn scale_of(decimal: &str) -> u32 {
-    match decimal.split_once('.') {
-        Some((_, frac)) => frac.trim_end_matches('0').len() as u32,
-        None => 0,
-    }
-}
+// `scale_of` and `raw_to_decimal` are venue-neutral and live in `akadro-core` (DRY),
+// re-exported here for this connector's public surface.
+pub use akadro_core::{raw_to_decimal, scale_of};
 
 /// Parse a decimal string to a raw fixed-point `i64` at `scale` (truncating excess
-/// precision). `"0.1"` @ 1 → `1`; `"123.456"` @ 2 → `12345`.
+/// precision). `"0.1"` @ 1 → `1`; `"123.456"` @ 2 → `12345`. Thin adapter over
+/// [`akadro_core::decimal_to_raw`] mapping a rejected value to this venue's error.
 ///
 /// # Errors
-/// [`OkxError::Parse`] if the digits are invalid.
+/// [`OkxError::Parse`] if `s` is empty, non-numeric, or overflows `i64`.
 pub fn decimal_to_raw(s: &str, scale: u32) -> Result<i64, OkxError> {
-    let neg = s.starts_with('-');
-    let s = s.trim_start_matches('-');
-    let (int_part, frac_part) = s.split_once('.').unwrap_or((s, ""));
-    let int_part = if int_part.is_empty() { "0" } else { int_part };
-    let mut frac = frac_part.to_string();
-    let scale_us = scale as usize;
-    frac.truncate(scale_us);
-    while frac.len() < scale_us {
-        frac.push('0');
-    }
-    let combined = format!("{int_part}{frac}");
-    let val: i64 = combined
-        .parse()
-        .map_err(|_| OkxError::Parse(format!("bad decimal {s:?}")))?;
-    Ok(if neg { -val } else { val })
-}
-
-/// Format a raw fixed-point `i64` at `scale` back to a decimal string for a body
-/// field: `(12345, 2)` → `"123.45"`, `(50, 0)` → `"50"`.
-#[must_use]
-pub fn raw_to_decimal(raw: i64, scale: u32) -> String {
-    // Clamp to the largest base-10 exponent a u128 holds (`10u128.pow(39)`
-    // overflows); guards a malformed precision row (bug class 3).
-    let scale = scale.min(38);
-    if scale == 0 {
-        return raw.to_string();
-    }
-    let neg = raw < 0;
-    let mag = raw.unsigned_abs();
-    let div = 10u128.pow(scale);
-    let int = (u128::from(mag) / div).to_string();
-    let frac = format!("{:0width$}", u128::from(mag) % div, width = scale as usize);
-    let frac = frac.trim_end_matches('0');
-    let s = if frac.is_empty() {
-        int
-    } else {
-        format!("{int}.{frac}")
-    };
-    if neg { format!("-{s}") } else { s }
+    akadro_core::decimal_to_raw(s, scale)
+        .ok_or_else(|| OkxError::Parse(format!("bad decimal {s:?} at scale {scale}")))
 }
 
 /// Milliseconds in an OKX bar token (`"1s"`, `"1m"`, `"15m"`, `"1H"`, `"4H"`,
@@ -453,6 +411,13 @@ pub fn parse_candles(
                 row.len()
             )));
         }
+        // Skip the current, still-forming bar: OKX sets the `confirm` field
+        // (index 8) to "0" while a candle is in progress and "1" once closed.
+        // Only judge when that field is present (>= 9 columns) so a legitimately
+        // shorter row is never mistaken for unclosed.
+        if row.len() >= 9 && row[8] != "1" {
+            continue;
+        }
         let open_ms: i64 = row[0]
             .parse()
             .map_err(|_| OkxError::Parse(format!("bad ts {:?}", row[0])))?;
@@ -482,7 +447,7 @@ pub fn parse_candles(
 /// Funding-rate fixed-point scale — re-exported from `akadro-core` so the connector
 /// and the engine's `mul_rate` charge cannot drift. Rates normalize to `1e-8`
 /// fractions (8 decimals): OKX's `"0.0001"` (0.01% per settlement) → `10_000` (= 1
-/// bp), and a sub-bp `"0.0000466"` → `4_669` instead of rounding to `0` as a
+/// bp), and a sub-bp `"0.0000466"` → `4_660` instead of rounding to `0` as a
 /// basis-point scale would. See `SimulatedExchange::with_funding_schedule`.
 pub use akadro_core::FUNDING_RATE_SCALE;
 
@@ -503,7 +468,7 @@ struct FundingHistRow {
 /// Parse `/api/v5/public/funding-rate-history` into a `(timestamp, rate)` schedule
 /// for `SimulatedExchange::with_funding_schedule`, sorted ascending by time.
 /// `fundingRate` is a decimal fraction normalized to [`FUNDING_RATE_SCALE`] (`1e-8`),
-/// so OKX's routinely **sub-bp** rates (e.g. `0.0000466` = 0.47 bp → `4_669`) are
+/// so OKX's routinely **sub-bp** rates (e.g. `0.0000466` = 0.47 bp → `4_660`) are
 /// preserved and accrue, rather than rounding to `0` at basis-point granularity. OKX
 /// returns newest-first, so the result is re-sorted.
 ///
@@ -623,18 +588,11 @@ pub fn fetch_funding_history_paged<T: Transport>(
 }
 
 /// The settlement period (milliseconds) implied by a funding `schedule`: the
-/// smallest positive gap between consecutive settlements, or OKX's standard 8h
-/// (`28_800_000`) when there are fewer than two points to infer it from. Divide by
-/// the bar length to get `with_funding_schedule`'s `interval_bars`.
-#[must_use]
-pub fn funding_period_ms(schedule: &[(Timestamp, i64)]) -> i64 {
-    schedule
-        .windows(2)
-        .map(|w| w[1].0.as_nanos() / 1_000_000 - w[0].0.as_nanos() / 1_000_000)
-        .filter(|d| *d > 0)
-        .min()
-        .unwrap_or(28_800_000)
-}
+/// smallest positive gap between consecutive settlements, or the standard 8h when
+/// there are fewer than two points to infer it from. Divide by the bar length to get
+/// `with_funding_schedule`'s `interval_bars`. Inference is venue-neutral, so this is
+/// a re-export of [`akadro_core::infer_funding_period_ms`] (DRY across connectors).
+pub use akadro_core::infer_funding_period_ms as funding_period_ms;
 
 /// A [`DataSource`] streaming OKX candles for one instrument. By default it does a
 /// single `/market/candles` fetch (the recent window, up to `limit`, cap 300); set
@@ -693,7 +651,11 @@ impl<T: Transport> OkxCandleFeed<T> {
     /// Set the page size (OKX caps `/market/candles` at 300, `history-candles` at 100).
     #[must_use]
     pub fn with_limit(mut self, limit: u32) -> Self {
-        self.limit = limit.min(300);
+        // history-candles (range mode) caps at 100; the recent /market/candles at
+        // 300. Re-apply the range cap so `with_limit` after `with_range` can't ask
+        // for 300 from a 100-capped endpoint regardless of builder order.
+        let cap = if self.range.is_some() { 100 } else { 300 };
+        self.limit = limit.min(cap);
         self
     }
 
@@ -928,8 +890,10 @@ impl<T: Transport> OkxExec<T> {
         }
     }
 
-    /// Set the ISO-8601 timestamp used for signing (the live transport derives it
-    /// from the system clock; tests set it for determinism).
+    /// Set the ISO-8601 timestamp used for signing. When unset, `submit` signs with
+    /// the current handler's event time; set this for deterministic signing in tests.
+    /// (There is no automatic system-clock derivation yet — once the `akadro-live`
+    /// shell lands it will drive [`ExecutionClient::sync_clock`] to keep this current.)
     #[must_use]
     pub fn with_timestamp(mut self, iso8601: impl Into<String>) -> Self {
         self.timestamp = iso8601.into();
@@ -1211,6 +1175,27 @@ mod tests {
             r#"{"code":"0","data":[["1700000000000","100","100","100","100","1","1","1","1"]]}"#;
         let bars = parse_candles(json, InstrumentId::new(0), 0, 0, "1s").unwrap();
         assert_eq!(bars[0].ts.as_nanos(), 1_700_000_001_000_000_000); // open + 1000ms, in ns
+    }
+
+    #[test]
+    fn parse_candles_skips_unclosed_bar() {
+        // The current bar arrives with confirm="0" (index 8); it must be dropped so a
+        // partial OHLCV with a future close-stamp never reaches a strategy.
+        let json = r#"{"code":"0","data":[
+            ["1700000060000","9","9","9","9","1","1","1","0"],
+            ["1700000000000","100","100","100","100","1","1","1","1"]
+        ]}"#;
+        let bars = parse_candles(json, InstrumentId::new(0), 0, 0, "1m").unwrap();
+        assert_eq!(bars.len(), 1); // only the confirmed bar
+        assert_eq!(bars[0].ts.as_nanos(), 1_700_000_060_000_000_000); // open 1700000000 + 60s
+        // A short row with no confirm field is kept (not mistaken for unclosed).
+        let short = r#"{"code":"0","data":[["1700000000000","1","1","1","1","1"]]}"#;
+        assert_eq!(
+            parse_candles(short, InstrumentId::new(0), 0, 0, "1m")
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

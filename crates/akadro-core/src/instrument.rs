@@ -45,12 +45,15 @@ pub enum Capability {
 impl Capability {
     #[inline]
     const fn bit(self) -> u64 {
-        // `self as u64` is the explicit discriminant above. The bitset has 64
-        // slots; a capability index must stay < 64. `1u64 << idx` would panic for
-        // `idx >= 64`, so we guard explicitly (const-eval errors if ever violated).
-        let idx = self as u64;
-        debug_assert!(idx < 64, "Capability bit index must be < 64");
-        1u64 << idx
+        // `self as u32` is the explicit discriminant above. The 64-slot bitset
+        // requires index < 64; `checked_shl` turns an out-of-range discriminant into
+        // a hard panic (a programmer error) in EVERY build, rather than a silently
+        // wrapped shift in release.
+        let idx = self as u32;
+        match 1u64.checked_shl(idx) {
+            Some(b) => b,
+            None => panic!("Capability bit index must be < 64"),
+        }
     }
 }
 
@@ -248,6 +251,53 @@ impl InstrumentSpec {
         }
     }
 
+    /// Snap `price` to the tick grid per `rule`: [`RoundingRule::TowardZero`] rounds
+    /// down (the conservative default, == [`round_price_down`](Self::round_price_down));
+    /// [`RoundingRule::Nearest`] rounds to the closest tick, ties toward zero. A
+    /// non-positive `tick_size` returns `price` unchanged.
+    #[must_use]
+    pub fn round_price(&self, price: Price, rule: RoundingRule) -> Price {
+        match rule {
+            RoundingRule::TowardZero => self.round_price_down(price),
+            RoundingRule::Nearest => {
+                let down = self.round_price_down(price);
+                let up = self.round_price_up(price);
+                let d_down = (i128::from(price.raw()) - i128::from(down.raw())).abs();
+                let d_up = (i128::from(up.raw()) - i128::from(price.raw())).abs();
+                if d_down <= d_up { down } else { up } // tie → toward zero
+            }
+        }
+    }
+
+    /// Snap `qty` to the lot grid per `rule`: [`RoundingRule::TowardZero`] truncates
+    /// (the conservative default, == [`round_qty_down`](Self::round_qty_down));
+    /// [`RoundingRule::Nearest`] rounds to the closest lot, ties toward zero. A
+    /// non-positive `lot_size` returns `qty` unchanged.
+    #[must_use]
+    pub fn round_qty(&self, qty: Qty, rule: RoundingRule) -> Qty {
+        let down = self.round_qty_down(qty);
+        let lot = self.lot_size.raw();
+        if matches!(rule, RoundingRule::TowardZero) || lot <= 0 || down.raw() == qty.raw() {
+            return down;
+        }
+        // Nearest: the away-from-zero neighbour (same sign as `qty`).
+        let away_raw = if qty.raw() >= 0 {
+            down.raw().checked_add(lot)
+        } else {
+            down.raw().checked_sub(lot)
+        };
+        let Some(away_raw) = away_raw else {
+            return down;
+        };
+        let d_down = (i128::from(qty.raw()) - i128::from(down.raw())).abs();
+        let d_away = (i128::from(qty.raw()) - i128::from(away_raw)).abs();
+        if d_down <= d_away {
+            down
+        } else {
+            Qty::from_raw(away_raw)
+        }
+    }
+
     /// `true` if `price * qty` meets the instrument's minimum notional (by
     /// absolute value). A negative `min_notional` is treated as "no minimum"
     /// (clamped to `0`), so a malformed spec can never silently disable the guard.
@@ -429,6 +479,55 @@ mod tests {
     fn rounding_rule_default() {
         assert_eq!(RoundingRule::default(), RoundingRule::TowardZero);
         assert_ne!(RoundingRule::Nearest, RoundingRule::TowardZero);
+    }
+
+    #[test]
+    fn round_with_rule() {
+        // tick 5, lot 10.
+        let s = InstrumentSpec::new(
+            InstrumentId::new(0),
+            AssetId::new(0),
+            AssetId::new(1),
+            InstrumentKind::Spot,
+            Price::from_raw(5),
+            Qty::from_raw(10),
+            Money::ZERO,
+            CapSet::empty().with(Capability::LimitOrders),
+        );
+        // Price: TowardZero == down; Nearest picks the closer tick.
+        assert_eq!(
+            s.round_price(Price::from_raw(13), RoundingRule::TowardZero),
+            Price::from_raw(10)
+        );
+        assert_eq!(
+            s.round_price(Price::from_raw(12), RoundingRule::Nearest),
+            Price::from_raw(10) // |12-10|=2 < |15-12|=3
+        );
+        assert_eq!(
+            s.round_price(Price::from_raw(13), RoundingRule::Nearest),
+            Price::from_raw(15) // |13-10|=3 > |15-13|=2
+        );
+        assert_eq!(
+            s.round_price(Price::from_raw(10), RoundingRule::Nearest),
+            Price::from_raw(10) // on-grid unchanged
+        );
+        // Qty: Nearest picks the closer lot; an exact tie goes toward zero.
+        assert_eq!(
+            s.round_qty(Qty::from_raw(16), RoundingRule::TowardZero),
+            Qty::from_raw(10)
+        );
+        assert_eq!(
+            s.round_qty(Qty::from_raw(14), RoundingRule::Nearest),
+            Qty::from_raw(10) // |14-10|=4 < |20-14|=6
+        );
+        assert_eq!(
+            s.round_qty(Qty::from_raw(16), RoundingRule::Nearest),
+            Qty::from_raw(20)
+        );
+        assert_eq!(
+            s.round_qty(Qty::from_raw(15), RoundingRule::Nearest),
+            Qty::from_raw(10) // exact tie → toward zero
+        );
     }
 
     #[test]

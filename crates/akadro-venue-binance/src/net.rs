@@ -52,14 +52,19 @@ impl ReqwestTransport {
 
 impl Transport for ReqwestTransport {
     fn send(&mut self, request: &HttpRequest) -> Result<HttpResponse, BinanceError> {
-        // Retry transient failures and rate-limit responses (429 Too Many
-        // Requests, 418 IP banned) with linear backoff; other non-2xx are returned
-        // as `Ok` for the caller to interpret.
+        // A SIGNED request (it carries `X-MBX-APIKEY` and a `timestamp` baked into
+        // the signed query) must NOT be slept-and-retried: after any back-off the
+        // signature is stale (`-1021`), and a 429/418 retry of a live order risks a
+        // duplicate `clientOrderId` resubmit. So only UNSIGNED (public) requests are
+        // retried in-transport (429/418 rate-limit + transient transport errors);
+        // a signed request returns immediately so `submit`/`observe` re-signs with a
+        // fresh timestamp next bar (the contract still emits OrderAccepted/Rejected).
+        let signed = request.api_key.is_some();
         let mut attempt = 0u32;
         loop {
             match self.try_send(request) {
                 Ok(resp) => {
-                    if matches!(resp.status, 429 | 418) && attempt < 4 {
+                    if !signed && matches!(resp.status, 429 | 418) && attempt < 4 {
                         attempt += 1;
                         let base = if resp.status == 418 { 60 } else { 1 };
                         std::thread::sleep(std::time::Duration::from_secs(
@@ -70,6 +75,9 @@ impl Transport for ReqwestTransport {
                     return Ok(resp);
                 }
                 Err(e) => {
+                    if signed {
+                        return Err(e);
+                    }
                     attempt += 1;
                     if attempt > 4 {
                         return Err(e);

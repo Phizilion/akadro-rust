@@ -28,6 +28,7 @@ pub const PERIODS_PER_YEAR_CRYPTO_1M: f64 = 525_600.0;
 /// for ranking utility (a constant-positive strategy out-ranks a flat one) and
 /// deliberately differs from empyrical/pyfolio, which return `NaN` there.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct PerformanceReport {
     /// Number of return periods (equity points minus one).
     pub periods: usize,
@@ -68,6 +69,25 @@ impl PerformanceReport {
         Self::from_equity_with(curve, periods_per_year, 0.0, 0.0)
     }
 
+    /// [`from_equity`] with the annualization factor **inferred from the curve's own
+    /// timestamps** ([`infer_periods_per_year`]) instead of supplied — removing the
+    /// silent "wrong `periods_per_year`" footgun (e.g. passing `252` for hourly bars)
+    /// for the common regular-cadence case.
+    ///
+    /// The inference is a *calendar*-frequency estimate (periods per 365.25-day year)
+    /// and matches akadro's 24/7-venue convention. It **cannot** recover an equity
+    /// 252-**trading-day** calendar from timestamps — for that, pass
+    /// [`PERIODS_PER_YEAR_EQUITY_DAILY`] to [`from_equity`] explicitly. Returns `None`
+    /// when the period can't be inferred (`< 2` points, non-increasing timestamps) or
+    /// the metrics aren't computable (see [`from_equity`]).
+    ///
+    /// [`from_equity`]: Self::from_equity
+    #[must_use]
+    pub fn from_equity_auto(curve: &[EquityPoint]) -> Option<Self> {
+        let periods_per_year = infer_periods_per_year(curve)?;
+        Self::from_equity(curve, periods_per_year)
+    }
+
     /// As [`Self::from_equity`] but with a per-period `risk_free` rate (subtracted
     /// in the Sharpe numerator) and a per-period `required_return` / MAR (the
     /// Sortino target: downside is measured below it and it is subtracted in the
@@ -85,21 +105,55 @@ impl PerformanceReport {
         if curve.iter().any(|p| p.equity.raw() <= 0) {
             return None;
         }
+        // Per-period simple returns from the (now strictly-positive) equity levels;
+        // every metric is then computed by the single source of truth, `from_returns`.
+        let returns: Vec<f64> = curve
+            .windows(2)
+            .map(|w| {
+                let prev = w[0].equity.raw() as f64;
+                (w[1].equity.raw() as f64 - prev) / prev
+            })
+            .collect();
+        Self::from_returns(&returns, periods_per_year, risk_free, required_return)
+    }
+
+    /// Compute metrics directly from a per-period **simple-return** series — the
+    /// single source of truth for the return→metrics math that [`from_equity_with`]
+    /// delegates to, and the seam a pooled out-of-sample return series (from
+    /// `WalkForwardSummary`) feeds without round-tripping through a synthetic curve.
+    ///
+    /// `total_return` is the compounded `∏(1 + rᵢ) − 1`; `max_drawdown` is taken over
+    /// a normalized equity path reconstructed from the returns (drawdown is
+    /// scale-invariant, so this equals a level-based computation). Sample variance
+    /// (`ddof = 1`) for Sharpe/volatility, population-denominator downside for
+    /// Sortino, and the same zero-denominator-limit convention as the rest of the
+    /// type — all identical to the level path.
+    ///
+    /// [`from_equity_with`]: Self::from_equity_with
+    ///
+    /// Returns `None` for an empty series, a non-finite / non-positive
+    /// `periods_per_year` (m28), or any return `≤ −100%` (a wipeout — reconstructed
+    /// equity would go non-positive, so the ratios are ill-defined; the honest
+    /// closed-loop "not computable" answer rather than a fabricated `NaN`).
+    #[must_use]
+    pub fn from_returns(
+        returns: &[f64],
+        periods_per_year: f64,
+        risk_free: f64,
+        required_return: f64,
+    ) -> Option<Self> {
+        if returns.is_empty() {
+            return None;
+        }
         // Annualization must be a positive, finite factor — otherwise `.sqrt()`
-        // yields `NaN`/`±∞` and every ratio becomes `Some(NaN)` instead of an honest
-        // `None` (m28).
+        // yields `NaN`/`±∞` and every ratio becomes `Some(NaN)` instead of `None`.
         if !(periods_per_year.is_finite() && periods_per_year > 0.0) {
             return None;
         }
-        // Every sample is now strictly positive, so all divisions below are safe.
-        let equity: Vec<f64> = curve.iter().map(|p| p.equity.raw() as f64).collect();
-        let first = equity[0];
-        let last = equity[equity.len() - 1];
-
-        // Per-period simple returns (every prior equity is > 0).
-        let mut returns = Vec::with_capacity(equity.len() - 1);
-        for w in equity.windows(2) {
-            returns.push((w[1] - w[0]) / w[0]);
+        // A return ≤ −100% drives the reconstructed equity ≤ 0 (a wipeout) — the same
+        // ill-defined case `from_equity` rejects via its non-positive-sample guard.
+        if returns.iter().any(|&r| 1.0 + r <= 0.0) {
+            return None;
         }
         let n = returns.len() as f64;
         let mean = returns.iter().sum::<f64>() / n;
@@ -130,21 +184,22 @@ impl PerformanceReport {
         let sharpe = ratio_or_limit(mean - risk_free, per_period_vol) * ann;
         let sortino = ratio_or_limit(mean - required_return, downside) * ann;
 
-        // Max drawdown over the (strictly positive) equity path.
-        let mut peak = first;
+        // Reconstruct a normalized equity path (base 1.0) for the total return and
+        // max drawdown; drawdown is scale-invariant, so this matches a level path.
+        let mut equity = 1.0_f64;
+        let mut peak = 1.0_f64;
         let mut max_dd = 0.0_f64;
-        for &e in &equity {
-            if e > peak {
-                peak = e;
+        for &r in returns {
+            equity *= 1.0 + r; // 1 + r > 0, guarded above
+            if equity > peak {
+                peak = equity;
             }
-            let dd = (peak - e) / peak; // peak >= first > 0
+            let dd = (peak - equity) / peak; // peak >= 1.0 > 0
             if dd > max_dd {
                 max_dd = dd;
             }
         }
-
-        // `n >= 1` and `total_return > -1` (last > 0), so this is always finite.
-        let total_return = (last - first) / first;
+        let total_return = equity - 1.0; // ∏(1 + rᵢ) − 1
         let annualized_return = (1.0 + total_return).powf(periods_per_year / n) - 1.0;
         let calmar = ratio_or_limit(annualized_return, max_dd);
 
@@ -174,6 +229,40 @@ fn ratio_or_limit(num: f64, denom: f64) -> f64 {
     } else {
         0.0
     }
+}
+
+/// Nanoseconds in a 365.25-day calendar year (the annualization base).
+const NANOS_PER_YEAR: f64 = 365.25 * 24.0 * 60.0 * 60.0 * 1e9;
+
+/// Infer the periods-per-year annualization factor from an equity curve's own
+/// timestamps: the **median** consecutive timestamp spacing → periods per 365.25-day
+/// calendar year. Using the median makes it robust to weekend/holiday gaps and the
+/// occasional missing bar (a few large gaps don't move the estimate).
+///
+/// Pair with [`PerformanceReport::from_equity_auto`] so Sharpe/volatility can't be
+/// silently mis-annualized by a hand-passed factor. Returns `None` for `< 2` points,
+/// a non-increasing pair (median step `≤ 0`), or a non-finite/non-positive result.
+///
+/// **Caveat:** this is a *calendar*-frequency estimate (a 24/7 venue convention). An
+/// equity 252-**trading-day** calendar is not recoverable from timestamps — such
+/// callers should pass [`PERIODS_PER_YEAR_EQUITY_DAILY`] to
+/// [`PerformanceReport::from_equity`] explicitly.
+#[must_use]
+pub fn infer_periods_per_year(curve: &[EquityPoint]) -> Option<f64> {
+    if curve.len() < 2 {
+        return None;
+    }
+    let mut steps: Vec<i64> = curve
+        .windows(2)
+        .map(|w| w[1].ts.as_nanos() - w[0].ts.as_nanos())
+        .collect();
+    steps.sort_unstable();
+    let median = steps[steps.len() / 2];
+    if median <= 0 {
+        return None;
+    }
+    let ppy = NANOS_PER_YEAR / median as f64;
+    (ppy.is_finite() && ppy > 0.0).then_some(ppy)
 }
 
 #[cfg(test)]
@@ -299,5 +388,90 @@ mod tests {
         assert!(
             PerformanceReport::from_equity(&[pt(1, 100), pt(2, 120), pt(3, -5)], 252.0).is_none()
         );
+    }
+
+    // --- from_returns extraction (m5) ---
+
+    #[test]
+    fn from_equity_delegates_to_from_returns() {
+        // from_equity_with now computes returns then delegates to from_returns, so the
+        // two paths must agree field-for-field on the same curve (behaviour-neutral).
+        use crate::returns_from_equity;
+        for curve in [
+            vec![pt(1, 100), pt(2, 110), pt(3, 121)],
+            vec![pt(1, 100), pt(2, 90), pt(3, 100), pt(4, 115)],
+            vec![pt(1, 100), pt(2, 120), pt(3, 90), pt(4, 130)],
+        ] {
+            let via_equity = PerformanceReport::from_equity(&curve, 252.0).unwrap();
+            let returns = returns_from_equity(&curve).unwrap();
+            let via_returns = PerformanceReport::from_returns(&returns, 252.0, 0.0, 0.0).unwrap();
+            assert_eq!(
+                via_equity, via_returns,
+                "delegation must be field-identical"
+            );
+        }
+    }
+
+    #[test]
+    fn from_returns_hand_computed_and_guards() {
+        // Two +10% periods: total = 1.1*1.1-1 = 0.21, no drawdown, +inf Sharpe (vol 0).
+        let r = PerformanceReport::from_returns(&[0.1, 0.1], 252.0, 0.0, 0.0).unwrap();
+        assert!(approx(r.total_return, 0.21));
+        assert!(approx(r.max_drawdown, 0.0));
+        assert_eq!(r.periods, 2);
+        // Guards: empty, bad ppy, and a wipeout (<= -100%) are all None.
+        assert!(PerformanceReport::from_returns(&[], 252.0, 0.0, 0.0).is_none());
+        assert!(PerformanceReport::from_returns(&[0.1], f64::NAN, 0.0, 0.0).is_none());
+        assert!(PerformanceReport::from_returns(&[0.1], -1.0, 0.0, 0.0).is_none());
+        assert!(
+            PerformanceReport::from_returns(&[0.2, -1.0], 252.0, 0.0, 0.0).is_none(),
+            "a -100% return wipes the (reconstructed) account out -> None"
+        );
+    }
+
+    // --- periods-per-year inference (m4) ---
+
+    #[test]
+    fn infer_periods_per_year_common_cadences() {
+        let day = 86_400_000_000_000i64; // 1 day in ns
+        let daily = [pt(0, 100), pt(day, 101), pt(2 * day, 102)];
+        assert!((infer_periods_per_year(&daily).unwrap() - 365.25).abs() < 1.0);
+        let min = 60_000_000_000i64; // 1 minute in ns
+        let m1 = [pt(0, 100), pt(min, 101), pt(2 * min, 102)];
+        assert!((infer_periods_per_year(&m1).unwrap() - 525_960.0).abs() < 60.0);
+    }
+
+    #[test]
+    fn infer_robust_to_a_gap() {
+        // Nine 1-minute steps and one 10-minute gap: the median ignores the gap.
+        let min = 60_000_000_000i64;
+        let mut ts = 0i64;
+        let mut curve = vec![pt(0, 100)];
+        for i in 1..=10 {
+            ts += if i == 5 { 10 * min } else { min };
+            curve.push(pt(ts, 100 + i));
+        }
+        assert!((infer_periods_per_year(&curve).unwrap() - 525_960.0).abs() < 60.0);
+    }
+
+    #[test]
+    fn infer_none_on_too_short_or_nonincreasing() {
+        assert!(infer_periods_per_year(&[]).is_none());
+        assert!(infer_periods_per_year(&[pt(1, 100)]).is_none());
+        assert!(infer_periods_per_year(&[pt(10, 100), pt(10, 101)]).is_none()); // dup ts -> step 0
+        assert!(infer_periods_per_year(&[pt(20, 100), pt(10, 101)]).is_none()); // descending
+    }
+
+    #[test]
+    fn from_equity_auto_matches_manual_inferred() {
+        let day = 86_400_000_000_000i64;
+        let curve = [pt(0, 100), pt(day, 110), pt(2 * day, 121)];
+        let ppy = infer_periods_per_year(&curve).unwrap();
+        assert_eq!(
+            PerformanceReport::from_equity_auto(&curve),
+            PerformanceReport::from_equity(&curve, ppy)
+        );
+        // Unsorted -> can't infer -> None (does not fabricate a factor).
+        assert!(PerformanceReport::from_equity_auto(&[pt(20, 100), pt(10, 110)]).is_none());
     }
 }

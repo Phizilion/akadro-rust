@@ -219,6 +219,7 @@ pub fn replay_trades(report: &RunReport, fee_bps: i64) -> Result<RunReport, Akad
 
 /// The outcome of comparing a saved report against its replay.
 #[derive(Debug, Default, Clone)]
+#[non_exhaustive]
 pub struct ReplayDiff {
     /// `true` when every compared invariant (fills, realized `PnL`, fees) matched.
     pub matches: bool,
@@ -379,7 +380,9 @@ mod tests {
         Engine::new(
             &specs,
             Money::from_raw(1_000_000),
-            HistoricalFeed::from_bars(bars),
+            // Bars synthesized from a RunReport (not user data); crate-internal ctor
+            // so this compiles with the public `import-bars` gate off.
+            HistoricalFeed::from_bars_unchecked(bars),
             exchange,
             strat,
         )
@@ -495,14 +498,16 @@ mod tests {
     #[test]
     fn diff_is_order_independent_for_equal_ts_cross_instrument_fills() {
         use akadro_core::ClientOrderId;
-        let f = |inst: u32, ts: i64| FillRecord {
-            id: ClientOrderId::new(0),
-            instrument: InstrumentId::new(inst),
-            side: Side::Buy,
-            price: Price::from_raw(100 + i64::from(inst)),
-            qty: Qty::from_raw(5),
-            fee: Money::ZERO,
-            ts: Timestamp::from_nanos(ts),
+        let f = |inst: u32, ts: i64| {
+            FillRecord::new(
+                ClientOrderId::new(0),
+                InstrumentId::new(inst),
+                Side::Buy,
+                Price::from_raw(100 + i64::from(inst)),
+                Qty::from_raw(5),
+                Money::ZERO,
+                Timestamp::from_nanos(ts),
+            )
         };
         // Same trade set at the same timestamp, delivered in feed order (inst 1
         // before inst 0) vs the replay's canonical (ts, instrument) order.

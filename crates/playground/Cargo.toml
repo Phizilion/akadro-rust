@@ -10,7 +10,9 @@ publish = false
 [dependencies]
 # The umbrella (backtest is on by default) plus analytics, the data cache, and
 # serde (to save the run report to a file).
-akadro = { path = "../akadro", features = ["analytics", "data", "serde"] }
+# import-bars: this scratch binary's A/B benches rebuild feeds from a reused Vec<Bar>;
+# the lab does NOT enable it. (The blessed path is data::load_or_cache_feed.)
+akadro = { path = "../akadro", features = ["analytics", "data", "serde", "import-bars"] }
 # The MEXC + OKX connectors with their real reqwest transports.
 akadro-venue-mexc = { path = "../akadro-venue-mexc", features = ["net"] }
 akadro-venue-okx = { path = "../akadro-venue-okx", features = ["net"] }

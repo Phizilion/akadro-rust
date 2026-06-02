@@ -156,7 +156,10 @@ impl ExecutionClient for DexExchange {
                     CostKind::LpFee,
                 ));
             }
-            if self.config.gas != 0 {
+            if self.config.gas > 0 {
+                // `> 0`, not `!= 0`: a negative (meaningless) gas must be treated as
+                // no gas, never credited as a rebate — matching the impact/LP-fee
+                // sign discipline above (m9).
                 costs.push(Cost::new(
                     self.config.gas_asset,
                     Money::from_raw(i128::from(self.config.gas)),
