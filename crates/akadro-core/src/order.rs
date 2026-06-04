@@ -14,6 +14,10 @@ use crate::fixed::{Price, Qty};
 use crate::ids::{AssetId, ClientOrderId, InstrumentId};
 
 /// Which side of the book an order rests on / lifts.
+///
+/// Deliberately **not** `#[non_exhaustive]`: a side is binary (buy or sell), the set is
+/// closed, and there is no future variant to reserve for — so exhaustive `match`es on it
+/// are correct and ergonomic rather than a semver hazard.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Side {
@@ -416,12 +420,24 @@ impl ClientCommandId {
 }
 
 /// Re-export for convenience: an order plus the id the engine assigned it.
+///
+/// `#[non_exhaustive]` (workspace growable-type policy); construct via
+/// [`PlacedOrder::new`] so adding a field later is not a breaking change.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub struct PlacedOrder {
     /// The id assigned at submission.
     pub id: ClientOrderId,
     /// The original request.
     pub request: OrderRequest,
+}
+
+impl PlacedOrder {
+    /// An order paired with the id the engine assigned it at submission.
+    #[must_use]
+    pub const fn new(id: ClientOrderId, request: OrderRequest) -> Self {
+        PlacedOrder { id, request }
+    }
 }
 
 #[cfg(test)]

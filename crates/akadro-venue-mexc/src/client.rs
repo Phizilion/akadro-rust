@@ -17,9 +17,9 @@ use std::collections::VecDeque;
 use std::fmt;
 
 use akadro_core::{
-    AccountEvent, CancelReason, ClientOrderId, Cost, CostKind, Costs, DataSource, Event, EventSink,
-    ExecutionClient, InstrumentCatalog, InstrumentId, OrderKind, OrderRequest, Qty, RejectReason,
-    Side, TimeInForce, Timestamp,
+    AccountEvent, BackfillProgress, CancelReason, ClientOrderId, Cost, CostKind, Costs, DataSource,
+    Event, EventSink, ExecutionClient, InstrumentCatalog, InstrumentId, OrderKind, OrderRequest,
+    PageSink, Qty, RejectReason, Side, TimeInForce, Timestamp,
 };
 
 use crate::convert::raw_to_decimal;
@@ -45,6 +45,12 @@ pub struct MexcKlineFeed<T> {
     start_ms: Option<i64>,
     end_ms: Option<i64>,
     limit: u32,
+    /// Opt-in per-page progress callback for a long `with_range` back-fill (D18:
+    /// the connector emits venue-neutral numbers; the consumer renders the bar).
+    progress: Option<Box<dyn FnMut(BackfillProgress)>>,
+    /// Opt-in per-page sink for incremental cache journaling (the cache layer
+    /// installs its `.partial` writer here so a long back-fill is resumable).
+    page_sink: Option<Box<dyn PageSink>>,
     buffer: VecDeque<akadro_core::Bar>,
     fetched: bool,
 }
@@ -73,9 +79,33 @@ impl<T: Transport> MexcKlineFeed<T> {
             start_ms: None,
             end_ms: None,
             limit: 500,
+            progress: None,
+            page_sink: None,
             buffer: VecDeque::new(),
             fetched: false,
         }
+    }
+
+    /// Register a per-page progress callback, invoked after each page of a
+    /// [`with_range`](Self::with_range) back-fill with the running
+    /// [`BackfillProgress`] (pages, bars, frontier). A consumer renders a download
+    /// bar from it; the connector itself does no terminal I/O. The callback never
+    /// fires on a cache hit (no download happens) or a single-page recent fetch.
+    #[must_use]
+    pub fn with_progress(mut self, f: impl FnMut(BackfillProgress) + 'static) -> Self {
+        self.progress = Some(Box::new(f));
+        self
+    }
+
+    /// Install a per-page [`PageSink`] (the cache's incremental journal), handed each
+    /// page of a [`with_range`](Self::with_range) back-fill before it is buffered, so
+    /// the download is resumable after an interrupt. Like `with_progress`, it never
+    /// fires on a single recent fetch. The cache layer supplies this; user code does
+    /// not need it.
+    #[must_use]
+    pub fn with_page_sink(mut self, sink: Box<dyn PageSink>) -> Self {
+        self.page_sink = Some(sink);
+        self
     }
 
     /// Restrict the feed to `[start_ms, end_ms)` (epoch-ms) and **back-fill the
@@ -164,6 +194,7 @@ impl<T: Transport> MexcKlineFeed<T> {
         let bar_ms = self.interval_ms();
         let mut all: Vec<akadro_core::Bar> = Vec::new();
         let mut cursor = start;
+        let mut pages: u32 = 0;
         while cursor < end {
             let page = match self.fetch_page(Some(cursor), Some(end - 1)) {
                 Ok(p) => p,
@@ -174,6 +205,12 @@ impl<T: Transport> MexcKlineFeed<T> {
                 Err(e) => {
                     if all.is_empty() {
                         return Err(e);
+                    }
+                    // Mid-range failure with pages already buffered: keep them (m18),
+                    // but signal the truncation so the cache loader does not dead-mark
+                    // the unfetched remainder as verified-empty (silent data loss).
+                    if let Some(sink) = self.page_sink.as_mut() {
+                        sink.on_error(&e.to_string());
                     }
                     break;
                 }
@@ -189,12 +226,24 @@ impl<T: Transport> MexcKlineFeed<T> {
             // a page shorter than `limit`: MEXC caps a klines response below the
             // requested limit, so a short page is normal mid-range, not the end.)
             let last_close_ms = page.last().expect("non-empty").ts.as_nanos() / 1_000_000;
+            if let Some(sink) = self.page_sink.as_mut() {
+                sink.on_page(&page); // incremental journal before buffering (resumable)
+            }
             all.extend(page);
+            pages += 1;
+            if let Some(cb) = self.progress.as_mut() {
+                cb(BackfillProgress::new(pages, all.len(), last_close_ms));
+            }
             if last_close_ms <= cursor {
                 break; // no forward progress
             }
             cursor = last_close_ms;
         }
+        // Pages can overlap at the cursor boundary (the cursor advances to a page's last
+        // close, which the next page may repeat). Sort + dedup by close-stamp so the
+        // assembled series has no duplicate bars — matching the other venue back-fills.
+        all.sort_by_key(|b| b.ts.as_nanos());
+        all.dedup_by_key(|b| b.ts.as_nanos());
         Ok(all)
     }
 
@@ -212,7 +261,12 @@ impl<T: Transport> DataSource for MexcKlineFeed<T> {
     fn next_event(&mut self) -> Option<Event> {
         if !self.fetched {
             self.fetched = true;
-            if self.fetch().is_err() {
+            if let Err(e) = self.fetch() {
+                // Truncated download (first-page failure): tell the page-sink so the
+                // cache loader does not dead-mark the remainder verified-empty.
+                if let Some(sink) = self.page_sink.as_mut() {
+                    sink.on_error(&e.to_string());
+                }
                 return None;
             }
         }
@@ -924,6 +978,130 @@ mod feed_cov {
         .with_limit(2);
         let n = core::iter::from_fn(|| feed.next_event()).count();
         assert_eq!(n, 3); // paginated across both pages
+    }
+
+    #[test]
+    fn backfill_dedups_overlapping_pages() {
+        // The cursor advances to a page's last close, which the next page may include
+        // again (boundary overlap). The back-fill must dedup by close-stamp so the
+        // assembled series has no duplicate bars (matching the other venue connectors).
+        let p1 = r#"[[1700000000000,"1","1","1","1","1",1700000060000,"1"],
+                     [1700000060000,"1","1","1","1","1",1700000120000,"1"]]"#;
+        // p2 repeats the bar closing at 1700000120000, then adds a new one (180000).
+        let p2 = r#"[[1700000060000,"1","1","1","1","1",1700000120000,"1"],
+                     [1700000120000,"1","1","1","1","1",1700000180000,"1"]]"#;
+        let t = MockTransport::new(vec![
+            HttpResponse::ok(p1),
+            HttpResponse::ok(p2),
+            HttpResponse::ok("[]"),
+        ]);
+        let mut feed = MexcKlineFeed::new(
+            t,
+            "https://api.mexc.com",
+            "BTCUSDT",
+            InstrumentId::new(0),
+            "1m",
+            2,
+            2,
+        )
+        .with_range(1_700_000_000_000, 1_700_000_600_000)
+        .with_limit(2);
+        let closes: Vec<i64> = core::iter::from_fn(|| feed.next_event())
+            .filter_map(|e| match e {
+                Event::Bar(b) => Some(b.ts.as_nanos()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            closes.len(),
+            3,
+            "4 bars fetched across overlapping pages dedup to 3 unique close-stamps"
+        );
+        let mut uniq = closes.clone();
+        uniq.dedup();
+        assert_eq!(
+            uniq, closes,
+            "no duplicate close-stamps remain (ascending, deduped)"
+        );
+    }
+
+    #[test]
+    fn with_progress_reports_each_page() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        // Same 2-page setup as backfill_paginates_full_range; assert the callback
+        // fires once per non-empty page with monotonically rising counts.
+        let p1 = r#"[[1700000000000,"1","1","1","1","1",1700000060000,"1"],
+                     [1700000060000,"1","1","1","1","1",1700000120000,"1"]]"#;
+        let p2 = r#"[[1700000120000,"1","1","1","1","1",1700000180000,"1"]]"#;
+        let t = MockTransport::new(vec![
+            HttpResponse::ok(p1),
+            HttpResponse::ok(p2),
+            HttpResponse::ok("[]"),
+        ]);
+        let seen: Rc<RefCell<Vec<akadro_core::BackfillProgress>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let sink = seen.clone();
+        let mut feed = MexcKlineFeed::new(
+            t,
+            "https://api.mexc.com",
+            "BTCUSDT",
+            InstrumentId::new(0),
+            "1m",
+            2,
+            2,
+        )
+        .with_range(1_700_000_000_000, 1_700_000_600_000)
+        .with_limit(2)
+        .with_progress(move |p| sink.borrow_mut().push(p));
+        let _ = core::iter::from_fn(|| feed.next_event()).count();
+        let s = seen.borrow();
+        assert_eq!(s.len(), 2, "one callback per non-empty page");
+        assert_eq!((s[0].pages, s[0].bars), (1, 2));
+        assert_eq!((s[1].pages, s[1].bars), (2, 3)); // cumulative bars
+        assert!(s[1].frontier_ms > s[0].frontier_ms, "frontier advances");
+    }
+
+    #[test]
+    fn with_page_sink_receives_each_page() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        // A test PageSink recording the size of each page handed to it. Same 2-page
+        // backfill; assert the connector journals each page through the sink.
+        #[derive(Default)]
+        struct RecSink(Rc<RefCell<Vec<usize>>>);
+        impl akadro_core::PageSink for RecSink {
+            fn on_page(&mut self, page: &[akadro_core::Bar]) {
+                self.0.borrow_mut().push(page.len());
+            }
+        }
+        let p1 = r#"[[1700000000000,"1","1","1","1","1",1700000060000,"1"],
+                     [1700000060000,"1","1","1","1","1",1700000120000,"1"]]"#;
+        let p2 = r#"[[1700000120000,"1","1","1","1","1",1700000180000,"1"]]"#;
+        let t = MockTransport::new(vec![
+            HttpResponse::ok(p1),
+            HttpResponse::ok(p2),
+            HttpResponse::ok("[]"),
+        ]);
+        let pages: Rc<RefCell<Vec<usize>>> = Rc::new(RefCell::new(Vec::new()));
+        let mut feed = MexcKlineFeed::new(
+            t,
+            "https://api.mexc.com",
+            "BTCUSDT",
+            InstrumentId::new(0),
+            "1m",
+            2,
+            2,
+        )
+        .with_range(1_700_000_000_000, 1_700_000_600_000)
+        .with_limit(2)
+        .with_page_sink(Box::new(RecSink(pages.clone())));
+        let _ = core::iter::from_fn(|| feed.next_event()).count();
+        assert_eq!(
+            *pages.borrow(),
+            vec![2, 1],
+            "each non-empty page is journaled"
+        );
     }
 
     #[test]

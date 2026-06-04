@@ -1,0 +1,10 @@
+[book]
+title = "akadro"
+description = "Exchange-agnostic backtesting & live trading in Rust, with a compile-time guarantee against look-ahead and strict backtest↔live parity."
+authors = ["akadro contributors"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "rust"
+git-repository-url = "https://github.com/akadro/akadro-rust"

@@ -45,7 +45,12 @@ This file is just the rules + where things live.
 - **Data only through akadro — never load your own.** Obtain the engine's
   [`DataSource`] ONLY from the akadro data API:
   - `akadro::data::load_or_cache_feed(...)` — download-once / replay-from-cache as a
-    ready feed (the usual path); `load_or_cache_many_feed(...)` for multi-instrument,
+    ready feed (the usual **spot** path); `load_or_cache_many_feed(...)` for multi-instrument,
+  - `akadro::data::load_or_cache_perp(...)` — for a **perpetual**: ONE call downloads &
+    caches BOTH the bars and the funding-rate history (funding is mandatory for a perp —
+    it's a real cost; a perp without funding is a hard error). Returns `{ feed, funding }`;
+    apply `funding` via `SimulatedExchange::with_funding_schedule`. Funding is cached too —
+    never re-download it per run.
   - `akadro_venue_mexc::MexcKlineFeed` (and other `akadro_venue_*` feeds) — fetch
     klines through the connector, driven straight into the `Engine`.
 

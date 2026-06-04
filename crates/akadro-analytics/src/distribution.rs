@@ -193,6 +193,102 @@ pub fn deflated_sharpe(
     probabilistic_sharpe(sr, sr_star, n, skew, kurtosis_excess)
 }
 
+/// Result of a CSCV [`probability_of_backtest_overfitting`] analysis.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct PboResult {
+    /// The PBO estimate in `0..=1`: the fraction of CSCV splits on which the
+    /// in-sample-best strategy ranked **at or below the out-of-sample median** (logit
+    /// `<= 0`). Near `0` ⇒ the in-sample selection generalises (robust); near `1` ⇒ the
+    /// in-sample optimisation is overfitting (the winner is no better than a coin-flip
+    /// out of sample).
+    pub pbo: f64,
+    /// Number of combinatorial IS/OOS splits evaluated, `C(n_groups, n_groups/2)`.
+    pub splits: usize,
+    /// Per-split logit `λ = ln(ω / (1 − ω))` of the in-sample-best strategy's
+    /// out-of-sample relative rank `ω ∈ (0, 1)`. The left tail (`λ <= 0`) is the PBO
+    /// mass; exposed so a caller can render the diagnostic histogram.
+    pub logits: Vec<f64>,
+}
+
+/// **Probability of Backtest Overfitting** via Combinatorial Symmetric Cross-Validation
+/// (Bailey, Borwein, López de Prado & Zhu, 2017).
+///
+/// `strategy_returns[j]` is the per-observation return series of trial strategy `j`
+/// (one parameter set / one backtest), all of the **same length** `T`. The `T`
+/// observations are partitioned into `n_groups` equal contiguous blocks (must be even,
+/// `>= 2`, `<= T`); over **every** way to choose `n_groups/2` blocks as in-sample (the
+/// complement out-of-sample) the in-sample-best strategy by [`per_period_sharpe`] is
+/// selected and its out-of-sample relative rank recorded. PBO is the fraction of splits
+/// where that in-sample winner lands at/below the out-of-sample median — i.e. the
+/// probability that picking the best in-sample is no better than chance out of sample.
+///
+/// Returns `None` on degenerate input: fewer than 2 strategies, an empty series,
+/// mismatched series lengths, or an invalid `n_groups` (odd, `< 2`, or `> T`).
+///
+/// Pure math over a returns matrix — no engine/data dependency; pair it with
+/// [`run_grid`](crate::run_grid) to build the matrix and with [`deflated_sharpe`] for
+/// the complementary multiple-testing view.
+#[must_use]
+pub fn probability_of_backtest_overfitting(
+    strategy_returns: &[Vec<f64>],
+    n_groups: usize,
+) -> Option<PboResult> {
+    let n_strats = strategy_returns.len();
+    if n_strats < 2 || n_groups < 2 || !n_groups.is_multiple_of(2) {
+        return None;
+    }
+    let t = strategy_returns[0].len();
+    if t < n_groups || strategy_returns.iter().any(|r| r.len() != t) {
+        return None;
+    }
+    // Equal contiguous blocks over the T observations (the last block absorbs any
+    // remainder via the `(g+1)*t/n` bound).
+    let block: Vec<(usize, usize)> = (0..n_groups)
+        .map(|g| (g * t / n_groups, (g + 1) * t / n_groups))
+        .collect();
+    let splits = crate::grid::combinatorial_splits(n_groups, n_groups / 2);
+    if splits.is_empty() {
+        return None;
+    }
+    // Concatenate strategy `j`'s returns over the observations in `groups`.
+    let gather = |groups: &[usize], j: usize| -> Vec<f64> {
+        let mut v = Vec::new();
+        for &g in groups {
+            let (a, b) = block[g];
+            v.extend_from_slice(&strategy_returns[j][a..b]);
+        }
+        v
+    };
+    let mut logits = Vec::with_capacity(splits.len());
+    for (is_groups, oos_groups) in &splits {
+        // In-sample-best strategy (highest IS per-period Sharpe).
+        let mut best = 0usize;
+        let mut best_sr = f64::NEG_INFINITY;
+        for j in 0..n_strats {
+            let sr = per_period_sharpe(&gather(is_groups, j));
+            if sr > best_sr {
+                best_sr = sr;
+                best = j;
+            }
+        }
+        // Out-of-sample relative rank of that winner among all strategies.
+        let star_oos = per_period_sharpe(&gather(oos_groups, best));
+        let rank = (0..n_strats)
+            .filter(|&j| per_period_sharpe(&gather(oos_groups, j)) <= star_oos)
+            .count();
+        // ω ∈ (0,1) — the `+1` keeps it off the 0/1 endpoints (finite logit).
+        let omega = rank as f64 / (n_strats as f64 + 1.0);
+        logits.push((omega / (1.0 - omega)).ln());
+    }
+    let below = logits.iter().filter(|&&l| l <= 0.0).count();
+    Some(PboResult {
+        pbo: below as f64 / logits.len() as f64,
+        splits: logits.len(),
+        logits,
+    })
+}
+
 /// **Walk-Forward Efficiency**: out-of-sample performance relative to in-sample,
 /// `oos / is_`. With a **positive** in-sample (the normal case), `1.0` means OOS
 /// held up, `< 1` is the usual decay, and `> 1` is OOS outperformance.
@@ -350,6 +446,81 @@ mod tests {
 
     fn approx(a: f64, b: f64, eps: f64) -> bool {
         (a - b).abs() < eps
+    }
+
+    /// `n` strategies over `n` equal blocks of `m` obs: strategy `j` earns `+0.02` in
+    /// block `j` and `-0.01` everywhere else — a maximally over-fittable matrix (each
+    /// strategy's edge lives in exactly one block).
+    fn overfit_matrix(n: usize, m: usize) -> Vec<Vec<f64>> {
+        (0..n)
+            .map(|j| {
+                (0..n)
+                    .flat_map(|g| {
+                        let r = if g == j { 0.02 } else { -0.01 };
+                        std::iter::repeat_n(r, m)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pbo_rejects_degenerate_input() {
+        let s = vec![0.01, -0.01, 0.02, -0.02, 0.01, -0.01, 0.02, -0.02];
+        // < 2 strategies, odd n_groups, n_groups > T, mismatched lengths, empty.
+        assert!(probability_of_backtest_overfitting(std::slice::from_ref(&s), 4).is_none());
+        assert!(probability_of_backtest_overfitting(&[s.clone(), s.clone()], 3).is_none());
+        assert!(probability_of_backtest_overfitting(&[s.clone(), s.clone()], 16).is_none());
+        assert!(
+            probability_of_backtest_overfitting(&[s.clone(), vec![0.0, 0.1]], 4).is_none(),
+            "mismatched series lengths"
+        );
+        assert!(probability_of_backtest_overfitting(&[], 4).is_none());
+    }
+
+    #[test]
+    fn pbo_zero_when_one_strategy_dominates() {
+        // Strategy 0 is best both in- and out-of-sample on every block → never overfit.
+        let s0 = vec![0.03, 0.01, 0.03, 0.01, 0.03, 0.01, 0.03, 0.01];
+        let s1 = vec![-0.03, -0.01, -0.03, -0.01, -0.03, -0.01, -0.03, -0.01];
+        let r = probability_of_backtest_overfitting(&[s0, s1], 4).unwrap();
+        assert_eq!(r.splits, 6, "C(4,2) = 6 symmetric splits");
+        assert!(
+            approx(r.pbo, 0.0, 1e-12),
+            "dominant strategy ⇒ PBO 0, got {}",
+            r.pbo
+        );
+        assert!(r.logits.iter().all(|&l| l > 0.0));
+    }
+
+    #[test]
+    fn pbo_one_when_edge_is_purely_in_block() {
+        // Each strategy's only edge is a single block; whenever it is the in-sample
+        // winner, that block is in-sample, so out-of-sample it is flat-negative and
+        // ranks at/below the OOS median — overfitting on every split → PBO 1.
+        let m = overfit_matrix(4, 3);
+        let r = probability_of_backtest_overfitting(&m, 4).unwrap();
+        assert_eq!(r.splits, 6);
+        assert!(
+            approx(r.pbo, 1.0, 1e-12),
+            "edge-in-one-block ⇒ PBO 1, got {}",
+            r.pbo
+        );
+        assert!(r.logits.iter().all(|&l| l <= 0.0));
+    }
+
+    #[test]
+    fn pbo_is_a_probability() {
+        // A mixed matrix: PBO stays in [0,1] with the right split count.
+        let m = vec![
+            vec![0.01, -0.02, 0.03, -0.01, 0.02, -0.03, 0.01, -0.01],
+            vec![-0.02, 0.03, -0.01, 0.02, -0.03, 0.01, -0.01, 0.02],
+            vec![0.02, 0.01, -0.02, 0.01, -0.01, 0.02, -0.02, 0.01],
+        ];
+        let r = probability_of_backtest_overfitting(&m, 4).unwrap();
+        assert_eq!(r.splits, 6);
+        assert!((0.0..=1.0).contains(&r.pbo));
+        assert_eq!(r.logits.len(), r.splits);
     }
 
     #[test]

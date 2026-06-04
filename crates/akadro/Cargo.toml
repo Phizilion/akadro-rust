@@ -18,6 +18,17 @@ akadro-indicators = { workspace = true, optional = true }
 akadro-analytics = { workspace = true, optional = true }
 akadro-data = { workspace = true, optional = true }
 akadro-live = { workspace = true, optional = true }
+# Venue connectors for the one-call `data::load` dispatch (behind the `venues`
+# feature, which turns on each connector's live `net` transport).
+akadro-venue-mexc = { workspace = true, optional = true }
+akadro-venue-okx = { workspace = true, optional = true }
+akadro-venue-binance = { workspace = true, optional = true }
+akadro-venue-bybit = { workspace = true, optional = true }
+akadro-venue-kucoin = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+# Heap profiler for the allocation-regression gate (the `alloc_gate` test, behind
+# `dhat-heap`). Pulled only when that feature is on; the library never references it.
+dhat = { workspace = true, optional = true }
 
 [dev-dependencies]
 # `import-bars` so the umbrella's own integration tests + doctests may build synthetic
@@ -49,10 +60,31 @@ escape-hatch = ["analytics", "akadro-analytics/escape-hatch"]
 import-bars = ["backtest", "akadro-backtest/import-bars"]
 # Columnar on-disk market-data cache.
 data = ["dep:akadro-data"]
+# One-call `data::load(Venue, symbol, interval, start, end)` dispatch over the venue
+# connectors (turns on their live `net` transports). A live/network path — the cache
+# engine beneath it (`data::load_bars` etc.) is usable without this.
+venues = [
+    "data",
+    "dep:thiserror",
+    "dep:akadro-venue-mexc",
+    "akadro-venue-mexc/net",
+    "dep:akadro-venue-okx",
+    "akadro-venue-okx/net",
+    "dep:akadro-venue-binance",
+    "akadro-venue-binance/net",
+    "dep:akadro-venue-bybit",
+    "akadro-venue-bybit/net",
+    "dep:akadro-venue-kucoin",
+    "akadro-venue-kucoin/net",
+]
 # Live trading shell: auto-reconnect feeds + paper trading.
 live = ["dep:akadro-live"]
 # Persist `RunReport` to/from a backward-compatible JSON file.
 serde = ["akadro-engine/serde"]
+# Allocation-regression gate: enables the `dhat` heap profiler for the `alloc_gate`
+# integration test (`cargo test -p akadro --features dhat-heap --test alloc_gate`).
+# Off by default; the library code never references dhat.
+dhat-heap = ["dep:dhat", "backtest"]
 
 [lints]
 workspace = true

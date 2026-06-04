@@ -42,6 +42,15 @@ pub trait DataSource {
     fn next_event(&mut self) -> Option<Event>;
 }
 
+/// A boxed `DataSource` is itself a `DataSource` — so a caller can pick the concrete
+/// feed type at runtime (e.g. one of several venue connectors) and still hand it to
+/// any generic `DataSource` consumer.
+impl DataSource for Box<dyn DataSource> {
+    fn next_event(&mut self) -> Option<Event> {
+        (**self).next_event()
+    }
+}
+
 /// A venue that accepts orders and reports account changes.
 ///
 /// The engine assigns each order a [`ClientOrderId`] deterministically and

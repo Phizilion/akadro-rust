@@ -24,9 +24,9 @@ mod walk_forward;
 pub use akadro_core::{BarOrderError, check_bars_ordered};
 pub use cross_section::{information_coefficient, information_ratio, rank_information_coefficient};
 pub use distribution::{
-    DistributionStats, cvar, deflated_sharpe, expected_max_sharpe_z, kurtosis, norm_cdf, norm_ppf,
-    per_period_sharpe, probabilistic_sharpe, returns_from_equity, skewness, var,
-    walk_forward_efficiency,
+    DistributionStats, PboResult, cvar, deflated_sharpe, expected_max_sharpe_z, kurtosis, norm_cdf,
+    norm_ppf, per_period_sharpe, probabilistic_sharpe, probability_of_backtest_overfitting,
+    returns_from_equity, skewness, var, walk_forward_efficiency,
 };
 pub use equity::{
     PERIODS_PER_YEAR_CRYPTO_1M, PERIODS_PER_YEAR_CRYPTO_DAILY, PERIODS_PER_YEAR_EQUITY_DAILY,

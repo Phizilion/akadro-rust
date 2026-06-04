@@ -183,6 +183,10 @@ impl Portfolio {
     }
 
     fn close_order(&mut self, id: ClientOrderId) {
+        // O(n) over the *currently-open* order count, which is tiny in practice (a
+        // strategy holds a handful of resting orders, not thousands), so the linear
+        // scan is cheaper than the bookkeeping of an index map. If a workload ever
+        // rests very many orders at once, switch `open` to a `HashSet<ClientOrderId>`.
         self.open.retain(|o| *o != id);
     }
 

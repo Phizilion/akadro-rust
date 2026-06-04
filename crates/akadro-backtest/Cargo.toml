@@ -18,6 +18,9 @@ akadro-analytics.workspace = true
 smallvec.workspace = true
 rand_core.workspace = true
 
+[dev-dependencies]
+proptest.workspace = true
+
 [features]
 # Off by default. Re-exposes the casual raw-`Vec<Bar>`/`Vec<Event>` feed constructors
 # `HistoricalFeed::{new, from_bars, try_from_bars}` — the D18 data-injection door.

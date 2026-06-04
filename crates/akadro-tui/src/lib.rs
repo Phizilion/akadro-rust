@@ -130,6 +130,11 @@ impl TuiState {
         );
         self.price.push((x, self.last_price));
         self.equity.push((x, self.last_equity));
+        // `remove(0)` shifts the bounded `max_points`-long window (O(n)). Kept a `Vec`
+        // deliberately: ratatui's `Dataset::data` needs a *contiguous* `&[(f64, f64)]`, so
+        // a `VecDeque` would force `make_contiguous` (a `&mut` at render) or a per-frame
+        // clone — and at a dashboard's human-cadence updates over a small capped window
+        // the shift is free. Not a hot path.
         let cap = self.cfg.max_points.max(1);
         if self.price.len() > cap {
             self.price.remove(0);

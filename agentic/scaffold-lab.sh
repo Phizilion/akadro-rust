@@ -62,6 +62,7 @@ publish = false
 # file tools are denied that path by .claude/settings.json — builds, can't read.
 akadro = { path = "$AKADRO_DIR/crates/akadro", features = ["analytics", "indicators", "data"] }
 akadro-venue-mexc = { path = "$AKADRO_DIR/crates/akadro-venue-mexc", features = ["net"] }
+akadro-venue-okx = { path = "$AKADRO_DIR/crates/akadro-venue-okx", features = ["net"] }
 
 [lints.rust]
 # Mirrored by #![forbid(unsafe_code)] in src/main.rs and enforced by
@@ -203,6 +204,7 @@ echo "akadro: $AKADRO_DIR  ->  bundle: $API_DIR"
 #    walk-forward runners) is NOT advertised — the docs match what the lab can call.
 ( cd "$AKADRO_DIR" && "$CARGO" doc --no-deps -p akadro --features "analytics,indicators,data" >/dev/null )
 ( cd "$AKADRO_DIR" && "$CARGO" doc --no-deps -p akadro-venue-mexc --all-features >/dev/null 2>&1 ) || true
+( cd "$AKADRO_DIR" && "$CARGO" doc --no-deps -p akadro-venue-okx --all-features >/dev/null 2>&1 ) || true
 rm -rf "$API_DIR/doc"; mkdir -p "$API_DIR"
 cp -r "$AKADRO_DIR/target/doc" "$API_DIR/doc"
 rm -rf "$API_DIR/doc/src"
@@ -213,13 +215,16 @@ if PATH="$HOME/.cargo/bin:$PATH" rustup run nightly rustdoc --version >/dev/null
   rm -rf "$API_DIR/json"; mkdir -p "$API_DIR/json"
   for c in akadro-core akadro-engine akadro-backtest akadro-analytics \
            akadro-indicators akadro-data akadro-live akadro-testkit \
-           akadro-venue-mexc akadro; do
-    # Match the lab's feature set: never enable the off-by-default `escape-hatch`
-    # footgun feature (only `akadro` + `akadro-analytics` define it).
+           akadro-venue-mexc akadro-venue-okx akadro; do
+    # Match the lab's feature set: never document the off-by-default footgun
+    # features `escape-hatch` (akadro-analytics) or `import-bars` (akadro-backtest),
+    # or the lab agent would see gated ctors (`from_bars`, `run_walk_forward`) it
+    # cannot actually call. Generate those two crates with NO features; everything
+    # else with `--all-features` (their gated surface, e.g. venue `net`, is wanted).
     case "$c" in
-      akadro)           feats="--features analytics,indicators,data" ;;
-      akadro-analytics) feats="" ;;
-      *)                feats="--all-features" ;;
+      akadro)                          feats="--features analytics,indicators,data" ;;
+      akadro-analytics|akadro-backtest) feats="" ;;
+      *)                               feats="--all-features" ;;
     esac
     # shellcheck disable=SC2086 # $feats is an intentional word-split flag list
     if ( cd "$AKADRO_DIR" && "$CARGO" +nightly rustdoc -p "$c" $feats \

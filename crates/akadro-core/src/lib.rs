@@ -36,6 +36,8 @@ mod funding;
 mod ids;
 mod instrument;
 mod order;
+mod page_sink;
+mod progress;
 mod traits;
 
 pub use bar_order::{BarOrderError, check_bars_ordered};
@@ -53,6 +55,8 @@ pub use order::{
     ClientCommandId, MarginMode, OrderAmend, OrderKind, OrderRequest, PlacedOrder, Side,
     TimeInForce, TrailKind, TriggerBy, VenueCommand,
 };
+pub use page_sink::PageSink;
+pub use progress::BackfillProgress;
 pub use traits::{DataSource, EventSink, ExecutionClient, InstrumentCatalog};
 
 /// Common imports for downstream crates: `use akadro_core::prelude::*;`.

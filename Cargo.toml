@@ -89,6 +89,7 @@ ratatui = "0.29"
 trybuild = "1.0"
 proptest = "1.5"
 criterion = "0.5"
+dhat = "0.3"
 
 # ----------------------------------------------------------------------------
 # Workspace-wide lints. Members opt in with `[lints] workspace = true`.

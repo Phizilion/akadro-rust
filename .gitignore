@@ -18,6 +18,9 @@ flamegraph.svg
 # Criterion benchmark output (keep results out of VCS)
 /target/criterion
 
+# Rendered mdbook HTML (source lives in book/src; the build is reproducible)
+/book/book/
+
 # Editor / OS noise
 .DS_Store
 *.swp

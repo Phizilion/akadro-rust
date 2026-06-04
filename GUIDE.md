@@ -212,6 +212,32 @@ the lab — those are the data-leakage doors. `api/examples/full_pipeline.rs` sh
 complete sanctioned flow: exchangeInfo → klines → Feather cache → backtest → analytics
 → replay oracle. Do **not** write your own HTTP fetcher or read foreign data files.
 
+### Perpetuals: bars AND funding, one call
+
+A perpetual backtest needs the funding-rate history as much as the candles — funding is
+a real recurring cost that moves PnL, so **akadro makes it mandatory**: a perp without
+funding is a hard error (the `SimulatedExchange` refuses to run one). Use
+`load_or_cache_perp`, which downloads-and-caches *both* the bars and the funding with
+one call (both replay from cache on re-runs — funding is never re-downloaded):
+
+```rust
+use akadro::data::{load_or_cache_perp, DataError};
+
+let perp = load_or_cache_perp(
+    bars_cache, funding_cache, instrument, price_scale, qty_scale,
+    || OkxCandleFeed::new(/* … */).with_range(start_ms, end_ms),     // bars
+    || okx::fetch_funding_history_paged(&mut tx, base, inst, 100)    // funding (mandatory)
+         .map_err(|e| DataError::Schema(e.to_string())),
+)?;  // errors if the venue has no funding for this perp
+
+let exchange = SimulatedExchange::new(specs.clone(), fee_bps)
+    .with_funding_schedule(instrument, interval_bars, perp.funding);  // apply it
+let report = Engine::new(&specs, cash, perp.feed, exchange, strategy)?.run();
+```
+
+For **spot**, use `load_or_cache_feed` (no funding). Don't fetch funding yourself per
+run — it's cached for you.
+
 ---
 
 ## 9. Running a backtest

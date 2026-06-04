@@ -24,9 +24,10 @@
 //! (a passphrase is required, unlike Binance).
 
 use akadro_core::{
-    AccountEvent, AssetId, Bar, CapSet, Capability, ClientOrderId, DataSource, Event, EventSink,
-    ExecutionClient, InstrumentCatalog, InstrumentId, InstrumentKind, InstrumentSpec, Money,
-    OrderKind, OrderRequest, Price, Qty, RejectReason, Side, TimeInForce, Timestamp,
+    AccountEvent, AssetId, BackfillProgress, Bar, CapSet, Capability, ClientOrderId, DataSource,
+    Event, EventSink, ExecutionClient, InstrumentCatalog, InstrumentId, InstrumentKind,
+    InstrumentSpec, Money, OrderKind, OrderRequest, PageSink, Price, Qty, RejectReason, Side,
+    TimeInForce, Timestamp,
 };
 use serde::Deserialize;
 
@@ -615,6 +616,10 @@ pub struct OkxCandleFeed<T> {
     page_delay: std::time::Duration,
     /// Bounded retries on a `429` (rate-limited) page before giving up.
     max_retries: u32,
+    /// Opt-in per-page progress callback for a long `with_range` back-fill.
+    progress: Option<Box<dyn FnMut(BackfillProgress)>>,
+    /// Opt-in per-page sink for incremental cache journaling (resumable back-fill).
+    page_sink: Option<Box<dyn PageSink>>,
     buffer: std::collections::VecDeque<Bar>,
     fetched: bool,
 }
@@ -643,9 +648,29 @@ impl<T: Transport> OkxCandleFeed<T> {
             range: None,
             page_delay: std::time::Duration::from_millis(120),
             max_retries: 8,
+            progress: None,
+            page_sink: None,
             buffer: std::collections::VecDeque::new(),
             fetched: false,
         }
+    }
+
+    /// Install a per-page [`PageSink`] (the cache's incremental journal), handed each
+    /// page of a [`with_range`](Self::with_range) back-fill before it is buffered so
+    /// the download is resumable. The cache layer supplies this; user code does not.
+    #[must_use]
+    pub fn with_page_sink(mut self, sink: Box<dyn PageSink>) -> Self {
+        self.page_sink = Some(sink);
+        self
+    }
+
+    /// Register a per-page progress callback for a [`with_range`](Self::with_range)
+    /// back-fill (see [`BackfillProgress`]); the consumer renders the bar. OKX pages
+    /// backward, so `frontier_ms` reports the oldest open reached.
+    #[must_use]
+    pub fn with_progress(mut self, f: impl FnMut(BackfillProgress) + 'static) -> Self {
+        self.progress = Some(Box::new(f));
+        self
     }
 
     /// Set the page size (OKX caps `/market/candles` at 300, `history-candles` at 100).
@@ -733,6 +758,7 @@ impl<T: Transport> OkxCandleFeed<T> {
         let mut all: Vec<Bar> = Vec::new();
         let mut cursor = end_ms; // OKX `after` is exclusive on the OPEN ts
         let mut retries = 0u32;
+        let mut pages: u32 = 0;
         loop {
             let url = format!(
                 "{}/api/v5/market/history-candles?instId={}&bar={}&after={}&limit={}",
@@ -758,6 +784,12 @@ impl<T: Transport> OkxCandleFeed<T> {
                         resp.status
                     )));
                 }
+                // Mid-range failure with pages already buffered: keep them, but signal
+                // the truncation so the cache loader does not dead-mark the unfetched
+                // remainder as verified-empty (silent data loss).
+                if let Some(sink) = self.page_sink.as_mut() {
+                    sink.on_error(&format!("history-candles HTTP {}", resp.status));
+                }
                 break; // mid-range error: keep the pages already fetched
             }
             retries = 0;
@@ -774,7 +806,14 @@ impl<T: Transport> OkxCandleFeed<T> {
             // Pages are ascending + close-stamped; the oldest OPEN ts drives `after`.
             let oldest_open_ms =
                 page.first().expect("non-empty").ts.as_nanos() / 1_000_000 - bar_ms;
+            if let Some(sink) = self.page_sink.as_mut() {
+                sink.on_page(&page); // incremental journal before buffering (resumable)
+            }
             all.extend(page);
+            pages += 1;
+            if let Some(cb) = self.progress.as_mut() {
+                cb(BackfillProgress::new(pages, all.len(), oldest_open_ms));
+            }
             if oldest_open_ms <= start_ms {
                 break;
             }
@@ -803,7 +842,12 @@ impl<T: Transport> DataSource for OkxCandleFeed<T> {
     fn next_event(&mut self) -> Option<Event> {
         if !self.fetched {
             self.fetched = true;
-            if self.fetch().is_err() {
+            if let Err(e) = self.fetch() {
+                // Truncated download: tell the page-sink so the cache loader does
+                // not record the unfetched remainder as verified-empty (silent loss).
+                if let Some(sink) = self.page_sink.as_mut() {
+                    sink.on_error(&e.to_string());
+                }
                 return None;
             }
         }
@@ -1316,6 +1360,41 @@ mod tests {
     }
 
     #[test]
+    fn with_progress_reports_each_page() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let seen: Rc<RefCell<Vec<BackfillProgress>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = seen.clone();
+        let mut feed = OkxCandleFeed::new(
+            MockTransport::new(vec![
+                hist_page(&[240_000, 180_000]),
+                hist_page(&[120_000, 60_000]),
+                hist_page(&[0]),
+                hist_page(&[]),
+            ]),
+            "http://x",
+            "BTC-USDT",
+            InstrumentId::new(0),
+            "1m",
+            2,
+            0,
+        )
+        .with_range(0, 300_000)
+        .with_page_delay(std::time::Duration::ZERO)
+        .with_progress(move |p| sink.borrow_mut().push(p));
+        while feed.next_event().is_some() {}
+        let s = seen.borrow();
+        // Three non-empty pages -> three callbacks; bars accumulate; frontier recedes.
+        assert_eq!(s.len(), 3);
+        assert_eq!(s.iter().map(|p| p.pages).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!((s[2].pages, s[2].bars), (3, 5));
+        assert!(
+            s[2].frontier_ms < s[0].frontier_ms,
+            "backward paging frontier recedes"
+        );
+    }
+
+    #[test]
     fn range_feed_filters_to_window_and_dedups() {
         // A page reaches past `start`; bars with open < start (here -60_000) and a
         // duplicate open are dropped, leaving only [60_000, 120_000).
@@ -1601,6 +1680,18 @@ mod tests {
             }],
         )
         .with_timestamp("2020-12-08T09:08:57.715Z")
+    }
+
+    #[test]
+    fn debug_hides_secret() {
+        // Regression-lock the credential-hiding guarantee: the API secret must never
+        // appear in Debug output (logs/panics). `exec_with` seeds secret = b"secret".
+        let dbg = format!("{:?}", exec_with(vec![], InstType::Spot));
+        assert!(dbg.contains("OkxExec"), "Debug should still name the type");
+        assert!(
+            !dbg.contains("secret"),
+            "Debug must not leak the API secret"
+        );
     }
 
     #[test]

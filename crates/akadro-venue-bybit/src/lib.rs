@@ -22,7 +22,7 @@
 use akadro_core::{
     AccountEvent, AssetId, Bar, CapSet, Capability, ClientOrderId, DataSource, Event, EventSink,
     ExecutionClient, InstrumentCatalog, InstrumentId, InstrumentKind, InstrumentSpec, Money,
-    OrderKind, OrderRequest, Price, Qty, RejectReason, Side, TimeInForce, Timestamp,
+    OrderKind, OrderRequest, PageSink, Price, Qty, RejectReason, Side, TimeInForce, Timestamp,
 };
 use serde::Deserialize;
 
@@ -617,6 +617,8 @@ pub struct BybitKlineFeed<T> {
     page_delay: std::time::Duration,
     /// Bounded retries on a `429` page.
     max_retries: u32,
+    /// Opt-in per-page sink for incremental cache journaling (resumable back-fill).
+    page_sink: Option<Box<dyn PageSink>>,
     buffer: std::collections::VecDeque<Bar>,
     fetched: bool,
 }
@@ -648,9 +650,19 @@ impl<T: Transport> BybitKlineFeed<T> {
             range: None,
             page_delay: std::time::Duration::from_millis(120),
             max_retries: 8,
+            page_sink: None,
             buffer: std::collections::VecDeque::new(),
             fetched: false,
         }
+    }
+
+    /// Install a per-page [`PageSink`] (the cache's incremental journal), handed each
+    /// page of a [`with_range`](Self::with_range) back-fill before it is buffered so
+    /// the download is resumable. The cache layer supplies this; user code does not.
+    #[must_use]
+    pub fn with_page_sink(mut self, sink: Box<dyn PageSink>) -> Self {
+        self.page_sink = Some(sink);
+        self
     }
 
     /// Set the page size (Bybit caps `/v5/market/kline` at 1000).
@@ -762,6 +774,9 @@ impl<T: Transport> BybitKlineFeed<T> {
                 .map(|b| b.ts.as_nanos() / 1_000_000 - interval_ms)
                 .min()
                 .expect("non-empty");
+            if let Some(sink) = self.page_sink.as_mut() {
+                sink.on_page(&page); // incremental journal before buffering (resumable)
+            }
             all.extend(page);
             if oldest_open_ms <= start_ms {
                 break;
@@ -798,7 +813,12 @@ impl<T: Transport> DataSource for BybitKlineFeed<T> {
     fn next_event(&mut self) -> Option<Event> {
         if !self.fetched {
             self.fetched = true;
-            if self.fetch().is_err() {
+            if let Err(e) = self.fetch() {
+                // Truncated download: tell the page-sink so the cache loader does
+                // not record the unfetched remainder as verified-empty (silent loss).
+                if let Some(sink) = self.page_sink.as_mut() {
+                    sink.on_error(&e.to_string());
+                }
                 return None;
             }
         }
@@ -1468,6 +1488,20 @@ mod tests {
             }],
         )
         .with_timestamp_ms(1_700_000_000_000)
+    }
+
+    #[test]
+    fn debug_hides_secret() {
+        // Credential-hiding regression lock (secret = b"secret" via exec_with).
+        let dbg = format!("{:?}", exec_with(vec![], Category::Spot));
+        assert!(
+            dbg.contains("BybitExec"),
+            "Debug should still name the type"
+        );
+        assert!(
+            !dbg.contains("secret"),
+            "Debug must not leak the API secret"
+        );
     }
 
     #[test]

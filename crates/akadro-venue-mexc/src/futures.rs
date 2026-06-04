@@ -13,8 +13,9 @@
 use std::collections::VecDeque;
 
 use akadro_core::{
-    Bar, CapSet, Capability, DataSource, Event, InstrumentId, InstrumentKind, InstrumentSpec,
-    Money, OrderKind, OrderRequest, Price, Qty, Side, TimeInForce, Timestamp,
+    BackfillProgress, Bar, CapSet, Capability, DataSource, Event, InstrumentId, InstrumentKind,
+    InstrumentSpec, Money, OrderKind, OrderRequest, PageSink, Price, Qty, Side, TimeInForce,
+    Timestamp,
 };
 use serde::Deserialize;
 
@@ -538,6 +539,10 @@ pub struct MexcFuturesKlineFeed<T> {
     page_delay: std::time::Duration,
     /// Bounded retries on a `429` (rate-limited) page before giving up.
     max_retries: u32,
+    /// Opt-in per-page progress callback for a long `with_range` back-fill.
+    progress: Option<Box<dyn FnMut(BackfillProgress)>>,
+    /// Opt-in per-page sink for incremental cache journaling (resumable back-fill).
+    page_sink: Option<Box<dyn PageSink>>,
     buffer: VecDeque<Bar>,
     fetched: bool,
 }
@@ -569,9 +574,29 @@ impl<T: Transport> MexcFuturesKlineFeed<T> {
             end_ms: None,
             page_delay: std::time::Duration::from_millis(120),
             max_retries: 8,
+            progress: None,
+            page_sink: None,
             buffer: VecDeque::new(),
             fetched: false,
         }
+    }
+
+    /// Install a per-page [`PageSink`] (the cache's incremental journal), handed each
+    /// page of a [`with_range`](Self::with_range) back-fill before it is buffered so
+    /// the download is resumable. The cache layer supplies this; user code does not.
+    #[must_use]
+    pub fn with_page_sink(mut self, sink: Box<dyn PageSink>) -> Self {
+        self.page_sink = Some(sink);
+        self
+    }
+
+    /// Register a per-page progress callback for a [`with_range`](Self::with_range)
+    /// back-fill (see [`BackfillProgress`]); the consumer renders the bar. The
+    /// `frontier_ms` reports the oldest open reached (this venue pages backward).
+    #[must_use]
+    pub fn with_progress(mut self, f: impl FnMut(BackfillProgress) + 'static) -> Self {
+        self.progress = Some(Box::new(f));
+        self
     }
 
     /// Restrict to `[start_ms, end_ms)` (epoch-ms) and back-fill the window,
@@ -666,6 +691,7 @@ impl<T: Transport> MexcFuturesKlineFeed<T> {
         let start_secs = start_ms / 1000;
         let mut cursor_end = end_ms / 1000;
         let mut all: Vec<Bar> = Vec::new();
+        let mut pages: u32 = 0;
         loop {
             let page = self.fetch_page(Some(start_secs), Some(cursor_end))?;
             if page.is_empty() {
@@ -679,7 +705,19 @@ impl<T: Transport> MexcFuturesKlineFeed<T> {
                 .min()
                 .expect("non-empty");
             let oldest_open_secs = oldest_close_secs - bar_secs;
+            if let Some(sink) = self.page_sink.as_mut() {
+                sink.on_page(&page); // incremental journal before buffering (resumable)
+            }
             all.extend(page);
+            pages += 1;
+            if let Some(cb) = self.progress.as_mut() {
+                // Backward paging: the frontier is the oldest open reached so far.
+                cb(BackfillProgress::new(
+                    pages,
+                    all.len(),
+                    oldest_open_secs * 1000,
+                ));
+            }
             if oldest_open_secs <= start_secs {
                 break;
             }
@@ -716,7 +754,12 @@ impl<T: Transport> DataSource for MexcFuturesKlineFeed<T> {
     fn next_event(&mut self) -> Option<Event> {
         if !self.fetched {
             self.fetched = true;
-            if self.fetch().is_err() {
+            if let Err(e) = self.fetch() {
+                // Truncated download: tell the page-sink so the cache loader does
+                // not record the unfetched remainder as verified-empty (silent loss).
+                if let Some(sink) = self.page_sink.as_mut() {
+                    sink.on_error(&e.to_string());
+                }
                 return None;
             }
         }
@@ -1131,6 +1174,36 @@ mod feed_tests {
         // The `end` cursor moved BACKWARD between requests (newest→oldest paging).
         assert!(feed.transport.sent[0].url.contains("end=1700000600"));
         assert!(feed.transport.sent[1].url.contains("end=1700000240"));
+    }
+
+    #[test]
+    fn with_progress_reports_each_backward_page() {
+        use crate::transport::MockTransport;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let recent = fut_cols(&[1_700_000_300, 1_700_000_360, 1_700_000_420]);
+        let older = fut_cols(&[1_700_000_000, 1_700_000_060, 1_700_000_120]);
+        let seen: Rc<RefCell<Vec<BackfillProgress>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = seen.clone();
+        let mut feed = MexcFuturesKlineFeed::new(
+            MockTransport::new(vec![HttpResponse::ok(recent), HttpResponse::ok(older)]),
+            "http://x",
+            "BTC_USDT",
+            InstrumentId::new(0),
+            "1m",
+            0,
+            0,
+        )
+        .with_range(1_700_000_000_000, 1_700_000_600_000)
+        .with_page_delay(std::time::Duration::ZERO)
+        .with_progress(move |p| sink.borrow_mut().push(p));
+        while feed.next_event().is_some() {}
+        let s = seen.borrow();
+        assert_eq!(s.len(), 2, "one callback per fetched page");
+        assert_eq!((s[0].pages, s[0].bars), (1, 3));
+        assert_eq!((s[1].pages, s[1].bars), (2, 6));
+        // Backward paging: the frontier (oldest open reached) moves earlier.
+        assert!(s[1].frontier_ms < s[0].frontier_ms, "frontier recedes");
     }
 
     #[test]

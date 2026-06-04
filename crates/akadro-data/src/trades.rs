@@ -113,6 +113,139 @@ pub fn bars_from_trades(
     bars
 }
 
+/// Aggregate finer-timeframe [`Bar`]s up to a coarser timeframe — the cache's
+/// multi-timeframe path. When a request for, say, 5m bars isn't cached but a 1m
+/// series is, the loader aggregates 1m→5m for the covered span and downloads only
+/// what's still missing.
+///
+/// `fine_ns` / `coarse_ns` are the input/output bar widths in nanoseconds. They must
+/// be **divisible** (`coarse_ns % fine_ns == 0`) with `coarse_ns >= fine_ns`,
+/// otherwise aggregation is meaningless and an empty vector is returned. Inputs are
+/// assumed time-ordered, unique, and all one instrument (the cache's contract);
+/// out-of-order input is caught by `debug_assert` rather than paying a release-mode
+/// sort.
+///
+/// Fine bars are bucketed by their **open** time (`close − fine_ns`, since akadro
+/// close-stamps); each coarse bar is `open = first.open`, `high = max`, `low = min`,
+/// `close = last.close`, `volume = Σ` (widened to `i128`, saturated back to `i64`),
+/// and **close-stamped** at `bucket_open + coarse_ns`.
+///
+/// Only **complete** buckets (exactly `coarse_ns / fine_ns` fine bars) are emitted —
+/// a partially-filled bucket (a hole, or the still-forming edge) is *not* trusted as
+/// a finished coarse bar. Use [`aggregate_bars_checked`] to also learn which coarse
+/// stamps were incomplete so the caller can fetch them.
+#[must_use]
+pub fn aggregate_bars(fine: &[Bar], fine_ns: i64, coarse_ns: i64) -> Vec<Bar> {
+    aggregate_bars_checked(fine, fine_ns, coarse_ns).0
+}
+
+/// As [`aggregate_bars`], but also returns the **close-stamps of incomplete buckets**
+/// (ascending): coarse buckets that held fewer than `coarse_ns / fine_ns` fine bars,
+/// so they're a hole (or the still-forming edge) rather than a finished coarse bar.
+/// The cache loader treats those stamps as still-missing and fetches them, never
+/// emitting a half-formed coarse bar from a partial bucket.
+#[must_use]
+pub fn aggregate_bars_checked(fine: &[Bar], fine_ns: i64, coarse_ns: i64) -> (Vec<Bar>, Vec<i64>) {
+    if fine.is_empty() || fine_ns <= 0 || coarse_ns < fine_ns || coarse_ns % fine_ns != 0 {
+        return (Vec::new(), Vec::new());
+    }
+    debug_assert!(
+        fine.windows(2)
+            .all(|w| w[0].ts.as_nanos() <= w[1].ts.as_nanos()),
+        "aggregate_bars requires time-ordered fine bars; got an out-of-order input"
+    );
+    let expected = coarse_ns / fine_ns; // fine bars in a complete coarse bucket
+    let instrument = fine[0].instrument;
+
+    let mut bars = Vec::new();
+    let mut incomplete = Vec::new();
+    let mut bucket: Option<i64> = None; // current bucket's open time
+    let (mut open, mut high, mut low, mut close) =
+        (Price::ZERO, Price::ZERO, Price::ZERO, Price::ZERO);
+    let (mut vol, mut count): (i128, i64) = (0, 0);
+
+    let flush = |b_open: i64,
+                 o: Price,
+                 h: Price,
+                 l: Price,
+                 c: Price,
+                 v: i128,
+                 n: i64,
+                 out: &mut Vec<Bar>,
+                 inc: &mut Vec<i64>| {
+        let close_stamp = b_open.saturating_add(coarse_ns);
+        if n == expected {
+            let v64 = i64::try_from(v).unwrap_or(i64::MAX);
+            out.push(Bar::new(
+                instrument,
+                Timestamp::from_nanos(close_stamp),
+                o,
+                h,
+                l,
+                c,
+                Qty::from_raw(v64),
+            ));
+        } else {
+            inc.push(close_stamp); // partial bucket → not a finished coarse bar
+        }
+    };
+
+    for b in fine {
+        // Close-stamped → open = close − fine_ns; bucket the open by coarse width.
+        let b_open =
+            b.ts.as_nanos()
+                .saturating_sub(fine_ns)
+                .div_euclid(coarse_ns)
+                * coarse_ns;
+        if bucket == Some(b_open) {
+            if b.high.raw() > high.raw() {
+                high = b.high;
+            }
+            if b.low.raw() < low.raw() {
+                low = b.low;
+            }
+            close = b.close;
+            vol += i128::from(b.volume.raw());
+            count += 1;
+        } else {
+            if let Some(prev) = bucket {
+                flush(
+                    prev,
+                    open,
+                    high,
+                    low,
+                    close,
+                    vol,
+                    count,
+                    &mut bars,
+                    &mut incomplete,
+                );
+            }
+            bucket = Some(b_open);
+            open = b.open;
+            high = b.high;
+            low = b.low;
+            close = b.close;
+            vol = i128::from(b.volume.raw());
+            count = 1;
+        }
+    }
+    if let Some(prev) = bucket {
+        flush(
+            prev,
+            open,
+            high,
+            low,
+            close,
+            vol,
+            count,
+            &mut bars,
+            &mut incomplete,
+        );
+    }
+    (bars, incomplete)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,5 +340,85 @@ mod tests {
         assert_eq!(bars.len(), 1);
         assert_eq!(bars[0].close.raw(), 42);
         assert_eq!(bars[0].volume.raw(), 7);
+    }
+
+    const MIN: i64 = 60_000_000_000; // 1m in ns
+
+    /// A 1m fine bar opening at `open_min` minutes (close-stamped at +1m).
+    fn fb(open_min: i64, open: i64, high: i64, low: i64, close: i64, vol: i64) -> Bar {
+        Bar::new(
+            InstrumentId::new(0),
+            Timestamp::from_nanos((open_min + 1) * MIN),
+            Price::from_raw(open),
+            Price::from_raw(high),
+            Price::from_raw(low),
+            Price::from_raw(close),
+            Qty::from_raw(vol),
+        )
+    }
+
+    #[test]
+    fn aggregate_1m_to_5m_complete() {
+        // 10 contiguous 1m bars → two complete 5m bars. OHLCV: open=first, high=max,
+        // low=min, close=last, vol=Σ; coarse bars close-stamped at bucket_open + 5m.
+        let fine: Vec<Bar> = (0..10)
+            .map(|i| fb(i, 10 + i, 20 + i, 5 + i, 15 + i, i + 1))
+            .collect();
+        let (coarse, incomplete) = aggregate_bars_checked(&fine, MIN, 5 * MIN);
+        assert!(incomplete.is_empty());
+        assert_eq!(coarse.len(), 2);
+
+        // Bucket 0: bars opening 0..4 min, close-stamped at 5m.
+        assert_eq!(coarse[0].ts.as_nanos(), 5 * MIN);
+        assert_eq!(coarse[0].open.raw(), 10); // first.open
+        assert_eq!(coarse[0].high.raw(), 24); // max(20..24)
+        assert_eq!(coarse[0].low.raw(), 5); // min(5..9)
+        assert_eq!(coarse[0].close.raw(), 19); // last.close (15+4)
+        assert_eq!(coarse[0].volume.raw(), 1 + 2 + 3 + 4 + 5);
+
+        // Bucket 1: bars opening 5..9 min, close-stamped at 10m.
+        assert_eq!(coarse[1].ts.as_nanos(), 10 * MIN);
+        assert_eq!(coarse[1].open.raw(), 15);
+        assert_eq!(coarse[1].high.raw(), 29);
+        assert_eq!(coarse[1].low.raw(), 10);
+        assert_eq!(coarse[1].close.raw(), 24);
+        assert_eq!(coarse[1].volume.raw(), 6 + 7 + 8 + 9 + 10);
+
+        // The plain entrypoint returns the same complete bars.
+        assert_eq!(aggregate_bars(&fine, MIN, 5 * MIN), coarse);
+    }
+
+    #[test]
+    fn incomplete_bucket_is_reported_not_emitted() {
+        // 7 bars: bucket 0 complete (0..4), bucket 1 partial (5,6 only) → not emitted,
+        // its close-stamp (10m) reported as still-missing so the loader fetches it.
+        let fine: Vec<Bar> = (0..7).map(|i| fb(i, 100, 100, 100, 100, 1)).collect();
+        let (coarse, incomplete) = aggregate_bars_checked(&fine, MIN, 5 * MIN);
+        assert_eq!(coarse.len(), 1);
+        assert_eq!(coarse[0].ts.as_nanos(), 5 * MIN);
+        assert_eq!(incomplete, vec![10 * MIN]);
+    }
+
+    #[test]
+    fn non_divisible_or_degenerate_yields_empty() {
+        let fine: Vec<Bar> = (0..6).map(|i| fb(i, 1, 1, 1, 1, 1)).collect();
+        // 5m is not a whole multiple of 2m.
+        assert!(aggregate_bars(&fine, 2 * MIN, 5 * MIN).is_empty());
+        // coarse < fine.
+        assert!(aggregate_bars(&fine, 5 * MIN, MIN).is_empty());
+        // Non-positive fine width, and empty input.
+        assert!(aggregate_bars(&fine, 0, 5 * MIN).is_empty());
+        assert!(aggregate_bars(&[], MIN, 5 * MIN).is_empty());
+        // coarse == fine is the identity (divisible, >=): one bar per bucket.
+        assert_eq!(aggregate_bars(&fine, MIN, MIN).len(), 6);
+    }
+
+    #[test]
+    fn volume_saturates_to_i64_max() {
+        // Two fine bars whose volumes sum past i64::MAX → saturate, never wrap.
+        let fine = vec![fb(0, 1, 1, 1, 1, i64::MAX), fb(1, 1, 1, 1, 1, i64::MAX)];
+        let coarse = aggregate_bars(&fine, MIN, 2 * MIN);
+        assert_eq!(coarse.len(), 1);
+        assert_eq!(coarse[0].volume.raw(), i64::MAX);
     }
 }

@@ -305,15 +305,19 @@ impl<S: Strategy, D: DataSource, X: ExecutionClient> Engine<S, D, X> {
                 // (6) notify the observer (read-only; never affects the run).
                 obs.on_bar(bar, eq, portfolio.fills());
             } else if let Event::Resync { instrument, ts } = &event {
-                // Forward the resync's instrument scope (m24): a per-instrument
-                // resync must not be widened into a venue-wide one downstream.
-                let ae = AccountEvent::Resync {
+                // Route the resync as an `AccountEvent` through the SAME `drain` path as
+                // every other account event (apply → specific/`on_account` dispatch →
+                // route the resulting orders), rather than hand-applying it inline — one
+                // code path, no parity-drift hazard. This is safe to reorder relative to
+                // the timers because `Portfolio::apply` treats a resync as an accounting
+                // no-op. The instrument scope is forwarded (m24): a per-instrument resync
+                // stays per-instrument and is never widened venue-wide.
+                sink.push(AccountEvent::Resync {
                     instrument: *instrument,
                     ts: *ts,
-                };
-                portfolio.apply(&ae);
-                // Timers due at this resync's time fire before on_account, batched
-                // with on_account's orders below (m19/m21).
+                });
+                // Timers due at this resync's time fire before on_account; their orders
+                // batch with on_account's via drain's `route_pending` (m19/m21).
                 fire_due_timers(
                     &mut strategy,
                     &market,
@@ -322,17 +326,6 @@ impl<S: Strategy, D: DataSource, X: ExecutionClient> Engine<S, D, X> {
                     &instruments,
                     now,
                 );
-                {
-                    let mut ctx = Ctx::new(
-                        MarketView::new(&market),
-                        &mut gate,
-                        &portfolio,
-                        &instruments,
-                        now,
-                    );
-                    strategy.on_account(&ae, &mut ctx);
-                }
-                route_pending(&mut gate, &mut exec, now, &mut sink);
                 drain(
                     &mut sink,
                     &market,

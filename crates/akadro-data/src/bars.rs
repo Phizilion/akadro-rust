@@ -44,6 +44,12 @@ pub enum DataError {
     /// The file's schema or metadata did not match expectations.
     #[error("schema/metadata error: {0}")]
     Schema(String),
+    /// A connector aborted a back-fill mid-stream (a transient transport/parse
+    /// error), so the downloaded window is *truncated*. Surfaced rather than
+    /// silently caching a partial range; the partial progress is journaled, so a
+    /// retry resumes from where it stopped. See the cache loader's error handling.
+    #[error("fetch incomplete: {0}")]
+    Fetch(String),
 }
 
 impl From<std::io::Error> for DataError {
@@ -57,7 +63,11 @@ impl From<std::io::Error> for DataError {
     }
 }
 
-fn schema_with_meta(instrument: InstrumentId, price_scale: u32, qty_scale: u32) -> Arc<Schema> {
+pub(crate) fn schema_with_meta(
+    instrument: InstrumentId,
+    price_scale: u32,
+    qty_scale: u32,
+) -> Arc<Schema> {
     let mut meta = HashMap::new();
     meta.insert("instrument".to_owned(), instrument.index().to_string());
     meta.insert("price_scale".to_owned(), price_scale.to_string());
@@ -83,6 +93,79 @@ fn schema_with_meta(instrument: InstrumentId, price_scale: u32, qty_scale: u32) 
     )
 }
 
+/// Encode `bars` into a 6-column [`RecordBatch`] matching [`schema_with_meta`]'s
+/// layout (`ts` as `Timestamp(ns, UTC)`, the rest `Int64` fixed-point raws). Shared
+/// by [`write_partition`] (LZ4 file) and the incremental `.partial` stream writer so
+/// both encode bars identically (DRY).
+pub(crate) fn bars_to_batch(schema: &Arc<Schema>, bars: &[Bar]) -> Result<RecordBatch, DataError> {
+    let col = |f: &dyn Fn(&Bar) -> i64| -> ArrayRef {
+        Arc::new(Int64Array::from(bars.iter().map(f).collect::<Vec<_>>()))
+    };
+    let ts_col: ArrayRef = Arc::new(
+        TimestampNanosecondArray::from(bars.iter().map(|b| b.ts.as_nanos()).collect::<Vec<_>>())
+            .with_timezone("UTC"),
+    );
+    let columns: Vec<ArrayRef> = vec![
+        ts_col,
+        col(&|b| b.open.raw()),
+        col(&|b| b.high.raw()),
+        col(&|b| b.low.raw()),
+        col(&|b| b.close.raw()),
+        col(&|b| b.volume.raw()),
+    ];
+    RecordBatch::try_new(schema.clone(), columns).map_err(|e| DataError::Arrow(e.to_string()))
+}
+
+/// Decode one [`RecordBatch`] (written by [`bars_to_batch`]) back into `Bar`s for
+/// `instrument`, appending to `out`. Validates the 6-column shape and the UTC `ts`
+/// annotation, so a structurally-wrong batch surfaces a [`DataError`] instead of
+/// panicking. Shared by [`read_partition`] and the `.partial` recovery path (DRY).
+pub(crate) fn batch_to_bars(
+    instrument: InstrumentId,
+    batch: &RecordBatch,
+    out: &mut Vec<Bar>,
+) -> Result<(), DataError> {
+    if batch.num_columns() != 6 {
+        return Err(DataError::Schema(format!(
+            "expected 6 columns, found {}",
+            batch.num_columns()
+        )));
+    }
+    if !matches!(
+        batch.schema().field(0).data_type(),
+        DataType::Timestamp(TimeUnit::Nanosecond, Some(tz)) if tz.as_ref() == "UTC"
+    ) {
+        return Err(DataError::Schema(
+            "ts column must be Timestamp(Nanosecond, \"UTC\")".to_owned(),
+        ));
+    }
+    let col = |i: usize| -> Result<&Int64Array, DataError> {
+        batch
+            .column(i)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| DataError::Schema(format!("column {i} is not Int64")))
+    };
+    let ts = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .ok_or_else(|| DataError::Schema("ts column is not Timestamp(Nanosecond)".to_owned()))?;
+    let (open, high, low, close, volume) = (col(1)?, col(2)?, col(3)?, col(4)?, col(5)?);
+    for r in 0..batch.num_rows() {
+        out.push(Bar::new(
+            instrument,
+            Timestamp::from_nanos(ts.value(r)),
+            Price::from_raw(open.value(r)),
+            Price::from_raw(high.value(r)),
+            Price::from_raw(low.value(r)),
+            Price::from_raw(close.value(r)),
+            Qty::from_raw(volume.value(r)),
+        ));
+    }
+    Ok(())
+}
+
 /// Write `bars` (all for one `instrument`, in ascending timestamp order) to `path`
 /// as an LZ4-compressed Feather partition. The instrument and fixed-point scales
 /// are stored in the file metadata so a reader reconstructs `Bar`s at the right
@@ -100,23 +183,7 @@ pub fn write_partition(
     bars: &[Bar],
 ) -> Result<(), DataError> {
     let schema = schema_with_meta(instrument, price_scale, qty_scale);
-    let col = |f: &dyn Fn(&Bar) -> i64| -> ArrayRef {
-        Arc::new(Int64Array::from(bars.iter().map(f).collect::<Vec<_>>()))
-    };
-    let ts_col: ArrayRef = Arc::new(
-        TimestampNanosecondArray::from(bars.iter().map(|b| b.ts.as_nanos()).collect::<Vec<_>>())
-            .with_timezone("UTC"),
-    );
-    let columns: Vec<ArrayRef> = vec![
-        ts_col,
-        col(&|b| b.open.raw()),
-        col(&|b| b.high.raw()),
-        col(&|b| b.low.raw()),
-        col(&|b| b.close.raw()),
-        col(&|b| b.volume.raw()),
-    ];
-    let batch = RecordBatch::try_new(schema.clone(), columns)
-        .map_err(|e| DataError::Arrow(e.to_string()))?;
+    let batch = bars_to_batch(&schema, bars)?;
 
     // LZ4-frame compression: the columnar i64 data compresses ~2-4x and decodes at
     // GB/s, so the smaller file is a net I/O win. Readers detect it from the header.
@@ -374,53 +441,11 @@ pub fn read_partition(path: &Path) -> Result<LoadedBars, DataError> {
 
     let mut bars = Vec::new();
     for batch in reader {
+        // The shape/tz guards (a structurally-valid Arrow file with the wrong column
+        // count or a non-UTC `ts`) live in `batch_to_bars`, shared with the `.partial`
+        // recovery path — so a bad batch surfaces a `DataError`, never a panic.
         let batch = batch.map_err(|e| DataError::Arrow(e.to_string()))?;
-        // Guard the column shape before indexing: a structurally-valid Arrow file
-        // with the wrong column count must surface a `DataError`, not panic on an
-        // out-of-range `batch.column(i)`.
-        if batch.num_columns() != 6 {
-            return Err(DataError::Schema(format!(
-                "expected 6 columns, found {}",
-                batch.num_columns()
-            )));
-        }
-        // The `ts` column must carry the UTC tz annotation we write. A tz-naive or
-        // differently-zoned external Arrow file downcasts to the same
-        // `TimestampNanosecondArray` and would be silently misread (i12).
-        if !matches!(
-            batch.schema().field(0).data_type(),
-            DataType::Timestamp(TimeUnit::Nanosecond, Some(tz)) if tz.as_ref() == "UTC"
-        ) {
-            return Err(DataError::Schema(
-                "ts column must be Timestamp(Nanosecond, \"UTC\")".to_owned(),
-            ));
-        }
-        let col = |i: usize| -> Result<&Int64Array, DataError> {
-            batch
-                .column(i)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| DataError::Schema(format!("column {i} is not Int64")))
-        };
-        let ts = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<TimestampNanosecondArray>()
-            .ok_or_else(|| {
-                DataError::Schema("ts column is not Timestamp(Nanosecond)".to_owned())
-            })?;
-        let (open, high, low, close, volume) = (col(1)?, col(2)?, col(3)?, col(4)?, col(5)?);
-        for r in 0..batch.num_rows() {
-            bars.push(Bar::new(
-                instrument,
-                Timestamp::from_nanos(ts.value(r)),
-                Price::from_raw(open.value(r)),
-                Price::from_raw(high.value(r)),
-                Price::from_raw(low.value(r)),
-                Price::from_raw(close.value(r)),
-                Qty::from_raw(volume.value(r)),
-            ));
-        }
+        batch_to_bars(instrument, &batch, &mut bars)?;
     }
     // The engine trusts a DataSource's time ordering; a corrupt/out-of-order
     // partition would silently produce wrong look-backs and fills, so reject it.
@@ -513,7 +538,15 @@ mod tests {
     }
 
     fn tmp(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("akadro_data_test_{name}.feather"))
+        // PID + atomic counter so two tests sharing a `name` never collide on the same
+        // on-disk file under parallel `cargo test` (matches manifest.rs/load.rs).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "akadro_data_test_{name}_{}_{}.feather",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ))
     }
 
     #[test]

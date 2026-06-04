@@ -7,6 +7,248 @@ release.
 
 ## [Unreleased]
 
+### Changed — quality-audit fixes: discipline drift + semver hazards
+From an adversarial quality audit (`audits/RATING_REPORT.md`), all high-priority items resolved
+(parity bit-identical: replay oracle + golden-master + `proptest_parity` re-verified):
+- **Overflow discipline**: the reduce-only `net_after` staging in `SimulatedExchange` and
+  the Wilder smoothing in RSI/ATR (`akadro-indicators`) used bare `+=` / `as i64`; now
+  `saturating_add` / `i64::try_from(..).unwrap_or(..)`, matching the rest of the code.
+- **`Costs` is now an opaque newtype** (was `pub type Costs = SmallVec<[Cost; 2]>`), so
+  `smallvec` is no longer in akadro's public API (D13). Read via `Deref<[Cost]>` /
+  `&Costs` iteration; build with `Costs::new` + `push`. No call site changed behaviour.
+- **`PlacedOrder` gained `#[non_exhaustive]` + `PlacedOrder::new`** (growable-type policy);
+  `Side` is documented as *intentionally* exhaustive (binary, closed — not a semver hazard).
+- **`BarOrderError` now implements `std::error::Error`** (via `thiserror`), so it composes
+  with `?` / `Box<dyn Error>`.
+- **Engine `Resync` now flows through the `drain` loop** like every other account event
+  (apply → dispatch → route), instead of a hand-applied inline copy — one code path, no
+  parity-drift hazard (safe because `Portfolio::apply` treats a resync as an accounting
+  no-op).
+
+### Added — test-gap closure + property tests + coverage-gate honesty (quality audit)
+- **New regression tests**: concurrent reduce-only orders in one bar capping at the
+  position (M11); an armed IOC stop-limit that can't fill expiring (not resting);
+  `Debug` credential-hiding for OKX/KuCoin/Bybit/Binance exec clients (was MEXC-only);
+  MEXC spot back-fill now dedups overlapping boundary pages (+ test), like the others.
+- **New property tests** (proptest): the `SimulatedExchange` reduce-only invariant
+  (arbitrary position + sell sizes never overshoot/flip), the cache-gap algebra
+  (`missing_gaps` over arbitrary cached sets always completes the coverage), and an
+  analytics **cross-validation** asserting Sharpe/Sortino/Calmar/vol against independent
+  closed-form (empyrical-convention) values — so the `ddof=1`/annualization claims are
+  code-verified, not prose.
+- **`bars.rs` test temp paths** now use PID + an atomic counter (no parallel-`cargo test`
+  collisions), matching the other data modules.
+- **Coverage gate reconciled to reality**: the CI line/region thresholds were `99/98`
+  while the tree measures ~97.1/97.8 (the live-IO `data/venues.rs` dispatch + the
+  `akadro-tui` UI were not excluded). Both are now excluded from the gate (same class as
+  `net.rs`/WS drivers) and the gate is set to its honest floor (`97/97`); the docs were
+  updated to the freshly-measured figures.
+- **Perf**: documented `Portfolio::close_order`'s `Vec::retain` (O(open-orders), tiny in
+  practice) and the `akadro-tui` rolling-window `Vec` (a `VecDeque` would fight ratatui's
+  contiguous-slice `Dataset` for no gain at UI cadence).
+
+### Added — mdbook "I got a lifetime error" guide (`book/`, D14)
+A human-facing book (`book/`, built by a new `mdbook` CI job) whose flagship page decodes
+the kill-feature *brand lifetime errors* a strategy author hits the first time they try to
+stash a `Ctx`/`Series`: the one-sentence cause (the per-call invariant lifetime), the
+one-line fix (copy `Copy` scalars out, never keep the view), a GOOD/BAD pair, a
+message→meaning→fix table (`E0521`, `E0624`, "no method `ahead`", "no `Index`"), and the
+honest threat model (`unsafe`/out-of-band not covered). Examples are anchored to the
+committed `akadro-compile-tests` trybuild proofs (the authoritative compile-fail checks).
+**The `#[strategy]` proc-macro (the other half of D14) is deliberately *not* built** — a
+reasoned non-fix: the `Strategy` trait already ships default no-op bodies for every hook
+except `on_bar` and uses elided late-bound `Ctx<'_>` lifetimes, so a strategy impl is
+already boilerplate-free; a macro would add a `syn`/`quote` crate and codegen over the
+kill-feature surface for no ergonomic gain (see roadmap §13.5).
+
+### Added — dhat allocation-regression gate (CI hardening, AGENTS §13.7)
+A new `alloc-gate` CI job runs `crates/akadro/tests/alloc_gate.rs` under the `dhat` heap
+profiler: a fixed 8000-bar backtest through the real engine + `SimulatedExchange`, with
+the **total allocation count bounded far below the bar count** (measured ~706 blocks /
+~1.2 MB peak; ceiling 2000 blocks). Because the per-event loop allocates nothing,
+allocations come only from amortized `Vec` growth and one-time setup — so a hot-loop
+allocation regression (e.g. an accidental per-bar `Box`) would push the count toward
+8000 and fail the gate (goal #4, performance). Behind the off-by-default `dhat-heap`
+feature (it swaps the global allocator), so normal builds/tests are byte-for-byte
+unaffected and `dhat` is never linked into the library. Run locally with
+`cargo test -p akadro --features dhat-heap --test alloc_gate`.
+
+### Fixed — data-layer silent-data-loss on a truncated download (`akadro-data` + connectors)
+A connector that aborted a back-fill mid-stream (a transient transport/parse error)
+surfaced the failure as an empty feed (`next_event() -> None`), indistinguishable from
+"the venue has no more data here". The cache loader then recorded the bars it got and
+**dead-marked the unfetched remainder `EmptyVerified`** — silently losing the tail
+forever (the residual flagged in the cache redesign). Now `PageSink` gains an additive
+`on_error(&str)` (default no-op) that every connector calls when it gives up on the
+remaining pages — both the `?`-propagate feeds (Binance/Bybit/KuCoin/MEXC-futures) and
+the keep-partial-break feeds (MEXC-spot/OKX, which previously swallowed the mid-range
+error entirely). The loader observes it via an `ObservingSink` and **fails fast**
+(`DataError::Fetch`) rather than caching a truncated window, while **keeping the
+`.partial` journal** so the next load's orphan recovery resumes from the pages already
+fetched. This also resolves the loader's documented "empty == possibly-failed fetch"
+ambiguity: an empty result *with* `on_error` is surfaced; a genuinely-empty no-data
+window still re-probes (returns `Ok`). The **public `DataSource` trait is unchanged** —
+the signal flows through the existing loader-owned page-sink seam (open/closed, goal #1).
+Two regression tests pin both directions; the successful-fetch path is byte-identical
+(parity golden-master + replay oracle + `proptest_parity` re-verified).
+
+### Changed — `MergeSource` k-way merge is now `O(log k)` (tournament tree, D15)
+`akadro_data::MergeSource` selected the next event with an `O(k)` linear scan over the
+buffered heads. It now uses a **tournament (winner) tree** (`TournamentTree`): each
+refill restores one root path in `O(log k)` comparisons — the sub-linear k-way merge of
+decision D15. The `(ts, child_index)` key and lower-index-wins tie-break are **exactly
+preserved**, so the merged stream is bit-identical to the linear merge — proven by a
+3000-iteration fuzz test against a naive reference (random `k`, lengths, and frequent
+ties) plus the existing ordering/tie-break tests. `benches/merge.rs` (the CI perf gate)
+adds the tournament tree alongside the `BinaryHeap` baseline and sweeps `k ∈ {12, 64}`:
+the tree is **~42 % faster than the heap at k = 12** (1.08 ms vs 1.85 ms) and ~26 %
+faster at k = 64 — both `O(log k)`, but the tree does one comparison per level vs the
+heap's ~two. Engine-facing data path, so parity golden-master + `proptest_parity` +
+determinism + replay oracle re-verified bit-identical.
+
+### Added — Probability of Backtest Overfitting (CSCV) in `akadro-analytics`
+`akadro_analytics::probability_of_backtest_overfitting(strategy_returns, n_groups) ->
+Option<PboResult>` implements the Bailey–Borwein–López de Prado–Zhu (2017) Combinatorial
+Symmetric Cross-Validation PBO: partition the `T` observations into `n_groups` equal
+blocks, and over every `C(n_groups, n_groups/2)` in-/out-of-sample split pick the
+in-sample-best strategy (by `per_period_sharpe`) and record its out-of-sample relative
+rank `ω = rank/(N+1)`; PBO is the fraction of splits where the logit `ln(ω/(1−ω)) ≤ 0`
+(the winner at/below the OOS median). `PboResult` carries `pbo`, the split count, and the
+per-split logits (for a diagnostic histogram). It complements the existing
+`deflated_sharpe` (multiple-testing-corrected Sharpe). Pure math over a returns matrix
+(no engine/data dep); 4 unit tests pin the extremes (dominant strategy → PBO 0,
+edge-in-one-block → PBO 1) + degenerate-input rejection. A 2-lens adversarial review
+confirmed the CSCV algorithm + DSR inputs are correct. The playground's `--overfit` flag
+demos both over the SMA grid (a live BTCUSDT 1h run: PSR 71% but Deflated SR 45% and PBO
+84% — strongly overfit, consistent with that run's walk-forward WFE of −0.27).
+
+### Added — range-aware, resumable, multi-timeframe bar cache (`akadro-data`)
+A ground-up redesign of the bar cache so a caller thinks about the data layer as
+little as possible: ask for a window, get the bars, with downloads minimized,
+interrupts survivable, and finer cached data reused. All of this is **above the
+engine**, so the conservative spot path stays bit-identical (parity golden-master +
+replay oracle + `proptest_parity` re-verified).
+
+- **Range-aware gap-fill, keyed by *(venue, symbol, interval)* — not the window.**
+  The cache records covered `(lo, hi)` close-stamp ranges in a per-series JSON
+  manifest (the **sole** source of truth — gap detection is a manifest read +
+  `missing_gaps` arithmetic, never a scan of the bar files). A request shifted by even
+  one second reuses what's present and downloads only the genuine holes
+  (`missing_gaps`, `Manifest::record_range`). A gap the venue truly has no data for is
+  recorded `Coverage::EmptyVerified` **once** (guarded by a settled-cutoff so a
+  not-yet-closed recent bar is retried, not dead-marked) and never re-attempted —
+  closing the "request more history than the venue keeps → re-download forever" hole.
+- **Incremental, resumable writes.** Each downloaded page is journaled to an
+  uncompressed, append-only Arrow IPC `.partial` stream as it arrives (`PartialWriter`,
+  installed on every connector feed via the new venue-neutral `akadro_core::PageSink`
+  seam + `with_page_sink`), at a configurable cadence (`FlushPolicy`: every N pages or
+  N seconds; default 8 pages / 5 s). An interrupt leaves the flushed pages recoverable;
+  the next run lazily compresses the orphaned `.partial` into a real LZ4 `.feather`
+  chunk, records its range, and resumes — never re-downloading what was already saved
+  (`recover_partial`, tolerant of a truncated tail). Compression happens **only** at
+  finalize/recovery, never per flush.
+- **Multi-timeframe aggregation.** `aggregate_bars` rolls finer bars up to a coarser
+  interval (OHLCV: open=first, high=max, low=min, close=last, vol=Σ, close-stamped,
+  complete-bucket-only); `load_bars_aggregated` satisfies a coarse request by
+  gap-filling the cached finer series and aggregating it up, downloading only the
+  finer data still missing.
+- **All venues via one DRY seam.** `with_page_sink` is wired into all six connector
+  feeds (MEXC spot + futures, Binance, OKX, Bybit, KuCoin); the loader is venue-neutral
+  (a `Fn(lo_ms, hi_ms, sink) -> impl DataSource` closure), so adding a venue needs zero
+  loader changes.
+- **Optional rate-limited concurrency.** `load_many` gap-fills many series at once over
+  `std::thread::scope` (no async — `tokio` stays in `akadro-live`), bounded by
+  `CacheOptions::concurrency` and a shared `RateLimiter` (per-venue req/s floor via
+  `default_req_per_sec`, user-overridable). Results come back in input order, each
+  series fault-isolated; per-series manifest files keep parallel workers race-free.
+- **One-call surface (the headline UX).** `akadro::data::load(&DataRequest::new(Venue,
+  symbol, interval, start, end), &opts, cache_dir)` resolves the venue catalogue +
+  scales and returns engine-ready bars (a `LoadedMarket`); `load_perp` adds the
+  mandatory funding schedule (a `PerpMarket`); `load_aggregated` rolls a cached finer
+  interval up to a coarse one; `load_many` gap-fills several requests concurrently —
+  so a caller never touches a venue crate, a `SeriesKey`, or a feed closure. Wired for
+  **all eight** venue variants behind the umbrella's `venues` feature: MEXC spot/futures,
+  OKX spot/swap, Binance spot/USDⓈ-M futures, Bybit spot/linear-perp, KuCoin spot
+  (`#[non_exhaustive]`). A caller always speaks the akadro interval vocabulary
+  (`"1h"`, …) and the umbrella maps it to each venue's **exact native token** (MEXC
+  spot `60m`, OKX uppercase `1H`/`1D`, Bybit minute-numbers `60`/`D`, KuCoin `1hour`).
+  It is an inherently live/network path (catalogue fetch + first download), so it is
+  exercised by the **playground against the real venues**, not the offline unit suite —
+  and the playground is migrated onto it (no direct venue-crate dep). Verified live
+  across all eight venues + perps + concurrency + 1m/1s/1h/4h + aggregation.
+- **Two cache-correctness fixes surfaced by live testing.** (1) **Download-seam
+  bar-boundary:** a gap is in close-stamp coords but a connector's `with_range` takes
+  open time, so the fetch now reaches back one bar — without it a bar at a
+  download-session seam was skipped (a 1-bar hole). (2) **No dead-marking a fully-empty
+  gap:** a completely empty fetch is indistinguishable from a *failed* one (the
+  connectors surface a transport/parse error as an empty feed), so a fully-empty gap is
+  now **re-probed** next load instead of recorded `EmptyVerified`. This removes a
+  silent-data-loss vector (one transient error could otherwise permanently suppress
+  re-download); the realistic "more history than the venue keeps" case is unaffected —
+  it returns *some* data, whose settled **leading hole** is still recorded `EmptyVerified`,
+  so deep-history requests don't re-download forever.
+- New API surface: `akadro_data::{load_bars, load_bars_feed, load_bars_aggregated,
+  load_many, SeriesKey, CacheOptions, SeriesRequest, FlushPolicy, RateLimiter,
+  default_req_per_sec, Coverage, missing_gaps, aggregate_bars, aggregate_bars_checked}`
+  + `akadro_core::{PageSink, impl DataSource for Box<dyn DataSource>}` + `akadro::data::{
+  Venue, DataRequest, LoadedMarket, PerpMarket, MarketError, load, load_perp,
+  load_aggregated, load_many}` (umbrella `venues` feature). 81 `akadro-data` tests +
+  umbrella venue-dispatch unit tests, clippy-clean, full gate green, **all eight venues
+  live-verified via the playground**.
+- **Playground exercises the full feature set live** (a scratch binary, not the library):
+  all eight venues + perps, 1s/1m/1h/4h intervals, gap-fill reuse, fee/cash/funding,
+  the replay trade-oracle + report save/reload, bench modes, and demo flags for
+  concurrency (`--symbols`), multi-timeframe aggregation (`--aggregate-from`), fill
+  realism (`--slippage-bps`/`--impact-bps`/`--latency-bars`/`--participation-bps`), and a
+  **structural walk-forward analysis** (`--walk-forward`): `WalkForwardBacktest` fits SMA
+  `(fast,slow)` on each in-sample train slice via `run_grid` and evaluates out-of-sample,
+  pooling per-fold OOS *returns* into a `WalkForwardSummary` with walk-forward efficiency
+  — the IS fit reuses the OOS `FillConfig` verbatim (`with_config`, no drift), and a
+  4-lens adversarial review confirmed **no IS/OOS leakage**. (A genuine BTCUSDT 1h run
+  showed the textbook overfit tell: mean IS +3.5% vs pooled OOS −0.9%, WFE −0.27.)
+
+### Changed — funding is cached like klines, and mandatory for perpetuals
+Funding-rate history was re-fetched on every backtest run (and could be silently
+disabled) while candles were cached — an asymmetry for data that is *as important* as
+candles (a real recurring cost that moves perp PnL). Now the library handles it:
+- **Funding cache** (`akadro_data::load_or_cache_funding` + `write_/read_funding_partition`)
+  — a versioned, atomic, ascending-validated 2-column Arrow partition (`ts`, `rate`),
+  mirroring the bar cache. Download once, replay from disk; never re-fetch per run.
+- **One call for both** — `akadro_data::load_or_cache_perp(bars_path, funding_path, …)`
+  returns `CachedPerp { feed, funding }`, downloading-and-caching the klines **and** the
+  funding history together, and **errors if a perpetual has no funding data**.
+- **Funding mandatory for perps** — `SimulatedExchange` now **panics on the first bar**
+  if any `PerpetualFuture` instrument has no funding configured (a schedule or a constant
+  `with_funding` rate): a perp backtest with zero funding is silently wrong, so it is a
+  hard setup error, not a default. Spot is unaffected; the conservative spot path stays
+  bit-identical (parity golden-master + replay oracle re-verified).
+- **Playground** drops the `--funding` disable flag (funding is always on for perps),
+  routes the venue funding fetch through `load_or_cache_funding` (cached next to the
+  klines), and hard-errors on a perp with no funding instead of "running with funding = 0".
+- Recorded the standing principle (memory + AGENTS.md): *the library does the plumbing so
+  the user thinks about strategy, not data/cache chores; think several steps ahead.*
+
+### Added — kline-download progress seam (connector emits, consumer renders)
+A long `with_range` back-fill used to run silently (the connector does the whole
+multi-page download inside one opaque `next_event()`). Added an opt-in per-page
+progress callback so a consumer can draw a download bar — keeping the UI out of the
+library (D18: the connector emits numbers, the consumer renders).
+- **`akadro_core::BackfillProgress`** (`#[non_exhaustive]` + `::new`; `pages`, `bars`,
+  `frontier_ms`) — the venue-neutral progress vocabulary, so one renderer works for any
+  venue. No foreign types.
+- **`with_progress(impl FnMut(BackfillProgress) + 'static)`** on `MexcKlineFeed`,
+  `MexcFuturesKlineFeed`, and `OkxCandleFeed` — invoked after each fetched page of a
+  ranged back-fill (forward-paging reports the latest close reached; backward-paging the
+  oldest open). Off by default (`None`) → bit-identical to before; never fires on a cache
+  hit. (binance/bybit/kucoin can adopt the identical builder later — same pattern; not
+  wired as they aren't used by the playground/lab.)
+- **Playground download bar** — a dependency-free stderr carriage-return bar
+  (`[####----] 42%  page 5/~12  12,345 bars`), estimating total pages from the requested
+  span; attached to all three playground venue downloads. No new crate dependency, no
+  `indicatif` in any library crate.
+- Closed loop: parity golden-master + replay oracle bit-identical (fetch-path-only,
+  above the engine); `progress.rs` 100% region, region gate held at 98.2%.
+
 ## [0.1.2] - 2026-06-02
 
 ### Changed — D18 enforcement: close the casual data-import doors (research-driven)

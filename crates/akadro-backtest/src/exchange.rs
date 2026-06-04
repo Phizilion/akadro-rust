@@ -196,10 +196,22 @@ pub struct SimulatedExchange {
     /// schedule does not overwrite the global cadence for every other instrument
     /// (m12). Absent instruments use [`FillConfig::funding_interval_bars`].
     funding_interval: HashMap<u32, u32>,
+    /// Set once on the first `observe`, after checking every perpetual instrument
+    /// has funding configured (a perp without funding is a fatal setup error — see
+    /// [`Self::observe`]'s `# Panics`).
+    funding_validated: bool,
 }
 
 impl SimulatedExchange {
     /// Create a simulated exchange charging a flat `fee_bps` taker fee.
+    ///
+    /// # Panics
+    /// The run panics on its first bar if any instrument is a
+    /// [`PerpetualFuture`](akadro_core::InstrumentKind::PerpetualFuture) with no
+    /// funding configured — a perpetual backtest without funding silently mis-states
+    /// `PnL`. Configure it via [`with_funding_schedule`](Self::with_funding_schedule)
+    /// (e.g. from `akadro_data::load_or_cache_perp`) or
+    /// [`with_funding`](Self::with_funding). Spot-only runs never panic.
     #[must_use]
     pub fn new(specs: Vec<InstrumentSpec>, fee_bps: i64) -> Self {
         SimulatedExchange {
@@ -215,6 +227,7 @@ impl SimulatedExchange {
             rng_drawn: false,
             funding_schedule: HashMap::new(),
             funding_interval: HashMap::new(),
+            funding_validated: false,
         }
     }
 
@@ -234,6 +247,7 @@ impl SimulatedExchange {
             shadow: HashMap::new(),
             funding_schedule: HashMap::new(),
             funding_interval: HashMap::new(),
+            funding_validated: false,
         }
     }
 
@@ -744,6 +758,41 @@ impl SimulatedExchange {
         self.resting = kept;
     }
 
+    /// Panic if any **perpetual** instrument has no funding configured. A perp
+    /// backtest with no funding silently mis-states `PnL` (funding is a real recurring
+    /// cost that often dominates a held position), so akadro refuses to run one —
+    /// "no funding for a perp" is a fatal setup error, not a zero-funding run.
+    ///
+    /// "Configured" = a non-empty per-instrument funding schedule, or a non-zero
+    /// constant rate ([`with_funding`](Self::with_funding)); either way the
+    /// settlement interval must be `> 0`.
+    fn validate_perp_funding(&self) {
+        for spec in &self.specs {
+            if spec.kind != InstrumentKind::PerpetualFuture {
+                continue;
+            }
+            let idx = spec.id.index();
+            let interval = self
+                .funding_interval
+                .get(&idx)
+                .copied()
+                .unwrap_or(self.config.funding_interval_bars);
+            let has_schedule = self
+                .funding_schedule
+                .get(&idx)
+                .is_some_and(|s| !s.is_empty());
+            assert!(
+                interval > 0 && (has_schedule || self.config.funding_bps != 0),
+                "perpetual instrument {idx} has no funding configured — a perpetual \
+                 backtest cannot run without funding (it is a real recurring cost that \
+                 materially moves PnL). Load bars+funding together via \
+                 `akadro_data::load_or_cache_perp` and apply the schedule with \
+                 `SimulatedExchange::with_funding_schedule`, or set a constant rate via \
+                 `with_funding(bps, interval_bars)`.",
+            );
+        }
+    }
+
     fn accrue_funding(&mut self, bar: &Bar, now: Timestamp, sink: &mut dyn EventSink) {
         // Per-instrument interval if a schedule set one, else the global cadence
         // (m12). `0` disables funding for this instrument.
@@ -967,6 +1016,14 @@ impl ExecutionClient for SimulatedExchange {
     fn observe(&mut self, event: &Event, now: Timestamp, sink: &mut dyn EventSink) {
         let Event::Bar(bar) = event else { return };
 
+        // Mandatory funding for perps: validate once, on the first bar (the point the
+        // simulation actually starts). A perp without funding aborts the run — see
+        // `validate_perp_funding`. Spot-only runs are unaffected (no perp specs).
+        if !self.funding_validated {
+            self.validate_perp_funding();
+            self.funding_validated = true;
+        }
+
         // Record the mark (this bar's close) for buying-power estimation at submit.
         self.shadow.entry(bar.instrument.index()).or_default().mark = bar.close.raw();
 
@@ -1164,7 +1221,8 @@ impl ExecutionClient for SimulatedExchange {
                     r.filled += want;
                     // Track the position as fills are staged so a later reduce-only
                     // order in this same bar sees the already-reduced net (M11).
-                    net_after += r.order.side.sign() * want;
+                    // Saturating, to match the project-wide overflow discipline.
+                    net_after = net_after.saturating_add(r.order.side.sign().saturating_mul(want));
                     // Deplete the shared bar volume cap so later orders on this
                     // instrument see only what's left.
                     if let Some(c) = cap.as_mut() {
@@ -1234,6 +1292,7 @@ impl ExecutionClient for SimulatedExchange {
 mod tests {
     use super::*;
     use akadro_core::{AssetId, CapSet, InstrumentKind, TriggerBy};
+    use proptest::prelude::*;
 
     const I: InstrumentId = InstrumentId::new(0);
 
@@ -1383,6 +1442,58 @@ mod tests {
             fills(&s),
             vec![(Price::from_raw(100), Qty::from_raw(5), Side::Buy)],
             "reduce-only fills only the 5 that flattens, not 10 (M10)"
+        );
+    }
+
+    #[test]
+    fn concurrent_reduce_only_orders_in_one_bar_do_not_overshoot() {
+        // M11: SEVERAL reduce-only orders resting in the SAME bar must collectively cap
+        // at the position, never overshoot or flip it — the second sees the position the
+        // first already (staged) reduced via `net_after`. Short 5, then two reduce-only
+        // BUYs of 3 and 4 (= 7 > 5) in one bar fill only 3 + 2 = 5, leaving flat.
+        let mut x = SimulatedExchange::new(vec![spec()], 0);
+        let mut s = Vec::new();
+        x.submit(
+            ClientOrderId::new(0),
+            OrderRequest::market(I, Side::Sell, Qty::from_raw(5)),
+            Timestamp::from_nanos(1),
+            &mut s,
+        );
+        s.clear();
+        x.observe(
+            &bar(100, 100, 100, 100, 1000),
+            Timestamp::from_nanos(2),
+            &mut s,
+        );
+        s.clear();
+        // Two reduce-only buys totalling 7, both resting for the next bar.
+        x.submit(
+            ClientOrderId::new(1),
+            OrderRequest::market(I, Side::Buy, Qty::from_raw(3)).reduce_only(),
+            Timestamp::from_nanos(3),
+            &mut s,
+        );
+        x.submit(
+            ClientOrderId::new(2),
+            OrderRequest::market(I, Side::Buy, Qty::from_raw(4)).reduce_only(),
+            Timestamp::from_nanos(3),
+            &mut s,
+        );
+        s.clear();
+        x.observe(
+            &bar(100, 100, 100, 100, 1000),
+            Timestamp::from_nanos(4),
+            &mut s,
+        );
+        let f = fills(&s);
+        let total: i64 = f.iter().map(|(_, q, _)| q.raw()).sum();
+        assert_eq!(
+            total, 5,
+            "two reduce-only buys (3+4) cap collectively at the short of 5, never 7 (M11)"
+        );
+        assert!(
+            f.iter().all(|(_, _, side)| *side == Side::Buy),
+            "all fills reduce the short (buys); none flips it"
         );
     }
 
@@ -2417,11 +2528,45 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "no funding configured")]
+    fn perp_without_funding_panics_on_first_bar() {
+        // Mandatory funding: a perpetual with no funding configured must abort the run
+        // (a perp backtest without funding silently mis-states PnL).
+        let mut x = SimulatedExchange::with_config(
+            vec![spec_kind(InstrumentKind::PerpetualFuture)],
+            FillConfig::default(),
+        );
+        let mut s = Vec::new();
+        x.observe(
+            &bar(100, 100, 100, 100, 1000),
+            Timestamp::from_nanos(1),
+            &mut s,
+        );
+    }
+
+    #[test]
+    fn spot_without_funding_runs_fine() {
+        // Spot has no funding — the perp enforcement must not touch it.
+        let mut x = SimulatedExchange::new(vec![spec()], 0);
+        let mut s = Vec::new();
+        x.observe(
+            &bar(100, 100, 100, 100, 1000),
+            Timestamp::from_nanos(1),
+            &mut s,
+        );
+        // No panic; nothing to assert beyond reaching here.
+    }
+
+    #[test]
     fn liquidation_force_closes_on_adverse_move() {
         let mut x = SimulatedExchange::with_config(
             vec![spec_kind(InstrumentKind::PerpetualFuture)],
             FillConfig::default(),
         )
+        // A perp must have funding configured (mandatory). A single zero-rate
+        // settlement satisfies that while charging nothing, so the liquidation
+        // assertions below are unaffected.
+        .with_funding_schedule(I, 1, vec![(Timestamp::from_nanos(0), 0)])
         .with_liquidation_bps(1000); // liquidate at 10% adverse
         let mut s = Vec::new();
         x.submit(
@@ -2504,6 +2649,50 @@ mod tests {
             fills(&s),
             vec![(Price::from_raw(100), Qty::from_raw(2), Side::Buy)]
         );
+    }
+
+    proptest! {
+        /// Fill-logic invariant over arbitrary inputs: a long position hit by any
+        /// sequence of reduce-only sells (arbitrary count and sizes, all in one bar)
+        /// is never **overshot** (total sold ≤ the position) and never **flipped**
+        /// (final net ≥ 0). Exercises the `net_after` staging (M10/M11) across the
+        /// whole input space, not just the two hand-picked cases.
+        #[test]
+        fn reduce_only_never_overshoots_or_flips(
+            pos in 1i64..50,
+            sizes in prop::collection::vec(1i64..40, 1..6),
+        ) {
+            let mut x = SimulatedExchange::new(vec![spec()], 0);
+            let mut s = Vec::new();
+            // Establish a long of `pos` (fills on the next bar).
+            x.submit(
+                ClientOrderId::new(0),
+                OrderRequest::market(I, Side::Buy, Qty::from_raw(pos)),
+                Timestamp::from_nanos(1),
+                &mut s,
+            );
+            s.clear();
+            x.observe(&bar(100, 100, 100, 100, 1_000_000), Timestamp::from_nanos(2), &mut s);
+            s.clear();
+            // K reduce-only sells of arbitrary sizes, all resting for the next bar.
+            for (i, &sz) in sizes.iter().enumerate() {
+                x.submit(
+                    ClientOrderId::new((i + 1) as u64),
+                    OrderRequest::market(I, Side::Sell, Qty::from_raw(sz)).reduce_only(),
+                    Timestamp::from_nanos(3),
+                    &mut s,
+                );
+            }
+            s.clear();
+            x.observe(&bar(100, 100, 100, 100, 1_000_000), Timestamp::from_nanos(4), &mut s);
+            let sold: i64 = fills(&s)
+                .iter()
+                .filter(|(_, _, side)| *side == Side::Sell)
+                .map(|(_, q, _)| q.raw())
+                .sum();
+            prop_assert!(sold <= pos, "reduce-only sold {sold} overshot the long {pos}");
+            prop_assert!(pos - sold >= 0, "reduce-only flipped the position");
+        }
     }
 }
 
@@ -3036,6 +3225,44 @@ mod cov_tests {
             &mut s,
         );
         assert!(!fills(&s).is_empty());
+    }
+
+    #[test]
+    fn armed_ioc_stop_limit_that_cannot_fill_expires() {
+        // An IOC stop-limit that TRIGGERS but whose limit can't fill on the arming bar
+        // must expire (IOC = take what's available now, cancel the rest) — NOT rest. A
+        // dormant (un-armed) conditional keeps resting under IOC; this is the *armed*
+        // case. Buy stop-limit trigger 110, limit 105: the bar gaps up through 110 (so
+        // it arms) but never trades down to the 105 buy limit, so nothing fills.
+        let mut x = SimulatedExchange::new(vec![spot()], 0);
+        let mut s = Vec::new();
+        x.submit(
+            ClientOrderId::new(0),
+            OrderRequest::stop_limit(
+                I,
+                Side::Buy,
+                Qty::from_raw(1),
+                Price::from_raw(110),
+                Price::from_raw(105),
+                TriggerBy::Last,
+            )
+            .with_tif(TimeInForce::Ioc),
+            Timestamp::from_nanos(1),
+            &mut s,
+        );
+        s.clear();
+        // open 111 ≥ trigger 110 → arms; low 111 > limit 105 → the buy limit can't fill.
+        x.observe(&bar(111, 113, 111, 112, 10), t(), &mut s);
+        assert!(
+            fills(&s).is_empty(),
+            "the 105 buy limit can't fill in a [111,113] bar"
+        );
+        assert_eq!(
+            expiries(&s),
+            vec![ClientOrderId::new(0)],
+            "an armed IOC stop-limit that can't fill expires, not rests"
+        );
+        assert_eq!(x.resting_count(), 0, "it must not be left resting");
     }
 
     #[test]

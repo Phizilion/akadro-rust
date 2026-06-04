@@ -4,11 +4,14 @@
 
 //! Playground: run a simple SMA-crossover strategy over historical klines.
 //!
-//! The live-data sibling of the `two_week_15m_backtest` integration test. It
-//! pulls genuine historical candles from a venue — MEXC spot (`--venue mexc`,
-//! `api.mexc.com`) or OKX spot/swap (`--venue okx`, paged `history-candles`,
-//! supports `1s`) — through the matching `akadro-venue-*` connector and runs them
-//! through the engine, so the numbers reflect actual market action.
+//! The live-data sibling of the `two_week_15m_backtest` integration test. It pulls
+//! genuine historical candles from a venue — MEXC spot (`--venue mexc`), MEXC futures
+//! (`--venue mexc-futures`), or OKX spot/swap (`--venue okx`, supports `1s`) — through
+//! the **one-call `akadro::data::load` / `load_perp`** surface: the range-aware,
+//! resumable cache resolves the catalogue, downloads only the missing gaps, and returns
+//! engine-ready bars (plus the funding schedule for a perp). The playground touches no
+//! venue crate directly — it just names a `Venue` and a window. The numbers reflect
+//! actual market action.
 //!
 //! **All parameters are runtime-configurable — no recompile needed.** Settings
 //! are resolved as: built-in defaults → `playground.toml` (if present in the
@@ -36,13 +39,15 @@
 use std::collections::HashMap;
 use std::error::Error;
 
-use akadro::analytics::{PerformanceReport, TradeStats};
-use akadro::backtest::{diff_reports, replay_trades};
-use akadro::data::load_or_cache;
+use akadro::analytics::{
+    PerformanceReport, TradeStats, WalkForwardSummary, deflated_sharpe, expected_max_sharpe_z,
+    kurtosis, per_period_sharpe, probabilistic_sharpe, probability_of_backtest_overfitting,
+    returns_from_equity, run_grid, skewness, walk_forward,
+};
+use akadro::backtest::{FillConfig, WalkForwardBacktest, diff_reports, replay_trades};
+use akadro::data::{CacheOptions, DataRequest, Venue, load, load_perp};
 use akadro::prelude::*;
-use akadro::types::{AssetId, InstrumentKind, InstrumentSpec, Timestamp, infer_funding_period_ms};
-use akadro_venue_mexc::{self as mexc, MexcCatalog, MexcKlineFeed, ReqwestTransport};
-use akadro_venue_okx as okx;
+use akadro::types::{InstrumentKind, InstrumentSpec, Timestamp};
 
 type Err = Box<dyn Error>;
 
@@ -53,6 +58,8 @@ const RUN_ARTEFACTS_DIR: &str = "run_artefacts";
 // --- Configuration -------------------------------------------------------------
 
 /// Every tunable, resolved from defaults / config file / CLI at runtime.
+// A CLI config legitimately has several independent on/off flags.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 struct Config {
     /// Data venue: `mexc` (spot REST klines), `mexc-futures` (perpetual contract
@@ -74,9 +81,6 @@ struct Config {
     deploy_pct: i64,
     /// Enforce the cash balance (reject unaffordable buys).
     enforce_cash: bool,
-    /// Accrue perpetual **funding** from the venue's funding-rate history (OKX
-    /// `…-SWAP` and `mexc-futures`; ignored for spot). On by default for perps.
-    funding: bool,
     /// If non-empty, save the `RunReport` JSON under `run_artefacts/` (loadable
     /// later). A bare file name is placed in that dir; an absolute path is honoured.
     save_report: String,
@@ -92,13 +96,49 @@ struct Config {
     /// `symbol` and this one **interleaved in a single process** (A,B,A,B…),
     /// removing cross-invocation machine drift, then exit.
     bench_vs: String,
+    /// Feature demo: comma-separated symbols to gap-fill **concurrently** via
+    /// `data::load_many` (rate-limited), then exit. E.g. `BTCUSDT,ETHUSDT,SOLUSDT`.
+    symbols: String,
+    /// Feature demo: load `--interval` by **aggregating** this finer interval
+    /// (`data::load_aggregated`), e.g. `--aggregate-from 1m --interval 5m`, then exit.
+    aggregate_from: String,
+    /// Fill realism: adverse slippage on liquidity-taking fills, basis points (0 = off).
+    slippage_bps: i64,
+    /// Fill realism: linear market-impact coefficient, basis points (0 = off).
+    impact_bps: i64,
+    /// Fill realism: execution latency in bars (0 = next-bar default).
+    latency_bars: u32,
+    /// Fill realism: max participation of a bar's volume, basis points (0 = uncapped).
+    participation_bps: i64,
+    /// Feature demo: run a **structural walk-forward analysis** (fit SMA params on each
+    /// in-sample train slice, evaluate out-of-sample), then exit. Spot only.
+    walk_forward: bool,
+    /// Walk-forward in-sample train length, in bars.
+    wf_train: usize,
+    /// Walk-forward out-of-sample test length, in bars.
+    wf_test: usize,
+    /// Walk-forward step (roll) between folds, in bars.
+    wf_step: usize,
+    /// Feature demo: run an **overfitting analysis** over the SMA grid — Deflated
+    /// Sharpe (multiple-testing-corrected) + Probability of Backtest Overfitting
+    /// (CSCV), then exit. Spot only.
+    overfit: bool,
+    /// CSCV group count for the PBO demo (even; `combinatorial_splits(n, n/2)`).
+    pbo_groups: usize,
+    /// Comma-separated fast-SMA windows for the WFA/overfit trial grid (empty = default
+    /// `5,10,20,50`). Fewer/narrower trials reduce selection bias.
+    grid_fast: String,
+    /// Comma-separated slow-SMA windows for the trial grid (empty = default
+    /// `20,50,100,200`).
+    grid_slow: String,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
             venue: "mexc".to_string(),
-            base_url: "https://api.mexc.com".to_string(),
+            // Empty → use the venue's built-in default base URL (set --base-url to override).
+            base_url: String::new(),
             symbol: "BTCUSDT".to_string(),
             interval: "5m".to_string(),
             start: 1_746_057_600_000, // 2025-05-01T00:00:00Z
@@ -109,11 +149,24 @@ impl Default for Config {
             cash: 1_000_000,
             deploy_pct: 90,
             enforce_cash: true,
-            funding: true,
             save_report: String::new(),
             repeat: 1,
             bench_kind_ab: false,
             bench_vs: String::new(),
+            symbols: String::new(),
+            aggregate_from: String::new(),
+            slippage_bps: 0,
+            impact_bps: 0,
+            latency_bars: 0,
+            participation_bps: 0,
+            walk_forward: false,
+            wf_train: 480,
+            wf_test: 120,
+            wf_step: 120,
+            overfit: false,
+            pbo_groups: 8,
+            grid_fast: String::new(),
+            grid_slow: String::new(),
         }
     }
 }
@@ -175,7 +228,17 @@ fn print_usage() {
         "playground — run the SMA-crossover backtest over MEXC data.\n\n\
          Resolution: defaults < playground.toml (cwd or --config) < --flag value.\n\n\
          Flags (all optional):\n  \
-           --venue <V>         mexc|mexc-futures|okx   (default mexc)\n  \
+           --venue <V>         mexc|mexc-futures|okx|binance|binance-futures|bybit|bybit-perp|kucoin (default mexc)\n  \
+           --symbols <A,B,C>   demo: gap-fill these symbols CONCURRENTLY (load_many), then exit\n  \
+           --aggregate-from <I> demo: build --interval by aggregating this finer interval, then exit\n  \
+           --walk-forward <B>  demo: structural walk-forward analysis (fit IS, eval OOS), then exit\n  \
+           --wf-train <N>      walk-forward in-sample train length, bars (default 480)\n  \
+           --wf-test <N>       walk-forward out-of-sample test length, bars (default 120)\n  \
+           --wf-step <N>       walk-forward roll step, bars (default 120)\n  \
+           --overfit <B>       demo: Deflated Sharpe + PBO (CSCV) over the SMA grid, then exit\n  \
+           --pbo-groups <N>    CSCV group count for PBO (even; default 8)\n  \
+           --grid-fast <A,B>   fast-SMA windows for the WFA/overfit grid (default 5,10,20,50)\n  \
+           --grid-slow <A,B>   slow-SMA windows for the grid (default 20,50,100,200)\n  \
            --symbol <S>        venue symbol            (default BTCUSDT; okx BTC-USDT-SWAP; mexc-futures BTC_USDT)\n  \
            --interval <I>      1s|1m|5m|15m|30m|1h|4h|1d (default 5m; 1s = okx only)\n  \
            --start <D>         YYYY-MM-DD or epoch-ms  (default 2025-05-01)\n  \
@@ -186,7 +249,10 @@ fn print_usage() {
            --cash <N>          starting cash, quote    (default 1000000)\n  \
            --deploy-pct <N>    %% of capital deployed  (default 90)\n  \
            --enforce-cash <B>  true|false cash guard   (default true)\n  \
-           --funding <B>       accrue OKX perp funding (default true; swap only)\n  \
+           --slippage-bps <N>  fill realism: adverse slippage on taker fills (default 0)\n  \
+           --impact-bps <N>    fill realism: linear market-impact bps (default 0)\n  \
+           --latency-bars <N>  fill realism: execution latency in bars (default 0)\n  \
+           --participation-bps <N> fill realism: cap on bar-volume share (default 0)\n  \
            --repeat <N>        re-run N times, report fastest (warm benchmark)\n  \
            --save-report <P>   save the RunReport JSON as run_artefacts/P (loadable later)\n  \
            --base-url <U>      REST base URL\n  \
@@ -267,11 +333,24 @@ fn load_config() -> Result<Config, Err> {
         cash: parse_or(&map, "cash", d.cash)?,
         deploy_pct: parse_or(&map, "deploy_pct", d.deploy_pct)?,
         enforce_cash: parse_or(&map, "enforce_cash", d.enforce_cash)?,
-        funding: parse_or(&map, "funding", d.funding)?,
         save_report: get_str("save_report", &d.save_report),
         repeat: parse_or(&map, "repeat", d.repeat)?,
         bench_kind_ab: parse_or(&map, "bench_kind_ab", d.bench_kind_ab)?,
         bench_vs: get_str("bench_vs", &d.bench_vs),
+        symbols: get_str("symbols", &d.symbols),
+        aggregate_from: get_str("aggregate_from", &d.aggregate_from),
+        slippage_bps: parse_or(&map, "slippage_bps", d.slippage_bps)?,
+        impact_bps: parse_or(&map, "impact_bps", d.impact_bps)?,
+        latency_bars: parse_or(&map, "latency_bars", d.latency_bars)?,
+        participation_bps: parse_or(&map, "participation_bps", d.participation_bps)?,
+        walk_forward: parse_or(&map, "walk_forward", d.walk_forward)?,
+        wf_train: parse_or(&map, "wf_train", d.wf_train)?,
+        wf_test: parse_or(&map, "wf_test", d.wf_test)?,
+        wf_step: parse_or(&map, "wf_step", d.wf_step)?,
+        overfit: parse_or(&map, "overfit", d.overfit)?,
+        pbo_groups: parse_or(&map, "pbo_groups", d.pbo_groups)?,
+        grid_fast: get_str("grid_fast", &d.grid_fast),
+        grid_slow: get_str("grid_slow", &d.grid_slow),
     })
 }
 
@@ -395,170 +474,550 @@ fn erfc(x: f64) -> f64 {
 /// instrument + its scales, and the bars (downloaded or from the on-disk cache).
 type Market = (Vec<InstrumentSpec>, InstrumentId, u32, u32, Vec<Bar>);
 
-/// MEXC spot REST klines (the connector paginates + the data layer caches).
-fn load_mexc(cfg: &Config, cache_path: &std::path::Path) -> Result<Market, Err> {
-    let mut transport = ReqwestTransport::new()?;
-    eprintln!("[mexc] exchangeInfo for {} ...", cfg.symbol);
-    let catalog = MexcCatalog::fetch(&mut transport, &cfg.base_url, &cfg.symbol)?;
-    let instrument = catalog
-        .id_of(&cfg.symbol)
-        .ok_or("symbol not present / not tradable")?;
-    let (price_scale, qty_scale) = catalog.scales(instrument).ok_or("no scales")?;
-    let (base, sym, iv, start, end) = (
-        cfg.base_url.clone(),
-        cfg.symbol.clone(),
-        cfg.interval.clone(),
-        cfg.start,
-        cfg.end,
-    );
-    eprintln!(
-        "[mexc] loading {} {} klines (cache or download) ...",
-        cfg.symbol, cfg.interval
-    );
-    let bars = load_or_cache(cache_path, instrument, price_scale, qty_scale, move || {
-        MexcKlineFeed::new(
-            ReqwestTransport::new().expect("transport"),
-            base,
-            sym,
-            instrument,
-            iv,
-            price_scale,
-            qty_scale,
-        )
-        .with_range(start, end)
-        .with_limit(1000)
-    })?;
-    Ok((
-        catalog.specs().to_vec(),
-        instrument,
-        price_scale,
-        qty_scale,
-        bars,
-    ))
+/// Map the config venue string to the umbrella's [`Venue`].
+fn venue_of(cfg: &Config) -> Result<Venue, Err> {
+    Ok(match cfg.venue.as_str() {
+        "mexc" => Venue::Mexc,
+        "mexc-futures" => Venue::MexcFutures,
+        "okx" => Venue::Okx,
+        "binance" => Venue::Binance,
+        "binance-futures" => Venue::BinanceFutures,
+        "bybit" => Venue::Bybit,
+        "bybit-perp" => Venue::BybitPerp,
+        "kucoin" => Venue::Kucoin,
+        other => {
+            return Err(format!(
+                "unknown venue '{other}' (mexc|mexc-futures|okx|binance|binance-futures|\
+                 bybit|bybit-perp|kucoin)"
+            )
+            .into());
+        }
+    })
 }
 
-/// MEXC **futures** (perpetual contract) klines via the contract API
-/// (`contract.mexc.com`). The symbol is the contract form, e.g. `BTC_USDT`; the
-/// `PerpetualFuture` `InstrumentSpec` comes from the futures catalogue
-/// (`contract/detail`) and bars from the paged `MexcFuturesKlineFeed`, cached by the
-/// data layer. The connector owns every request — the playground only orchestrates.
-fn load_mexc_futures(cfg: &Config, cache_path: &std::path::Path) -> Result<Market, Err> {
-    let base = mexc::FUTURES_BASE_URL.to_string();
-    let mut transport = ReqwestTransport::new()?;
-    eprintln!("[mexc-futures] contract/detail for {} ...", cfg.symbol);
-    let contract = mexc::fetch_contracts(&mut transport, &base)?
-        .into_iter()
-        .find(|c| c.symbol == cfg.symbol)
-        .ok_or("mexc futures contract not found / not tradable (try e.g. BTC_USDT)")?;
-    let (price_scale, qty_scale) = (contract.price_scale, contract.qty_scale);
-    let instrument = InstrumentId::new(0);
-    let spec = contract.to_spec(instrument, AssetId::new(0), AssetId::new(1));
-    let (sym, iv, start, end) = (cfg.symbol.clone(), cfg.interval.clone(), cfg.start, cfg.end);
-    eprintln!(
-        "[mexc-futures] {} {} contract klines (cache or download) ...",
-        cfg.symbol, cfg.interval
-    );
-    let bars = load_or_cache(cache_path, instrument, price_scale, qty_scale, move || {
-        mexc::MexcFuturesKlineFeed::new(
-            ReqwestTransport::new().expect("transport"),
-            base,
-            sym,
-            instrument,
-            iv,
-            price_scale,
-            qty_scale,
-        )
-        .with_range(start, end)
-    })?;
-    Ok((vec![spec], instrument, price_scale, qty_scale, bars))
-}
-
-/// OKX paged `history-candles` (spot or perpetual swap; supports `1s`). The
-/// instrument type is inferred from the instId: `…-SWAP` is a perpetual, anything
-/// else is treated as spot — so `BTC-USDT-SWAP` and `BTC-USDT` give a perp and a
-/// spot `InstrumentSpec` respectively (the only difference being the instrument
-/// `kind` the engine/exchange see).
-fn load_okx(cfg: &Config, cache_path: &std::path::Path) -> Result<Market, Err> {
-    let inst_type = if cfg.symbol.ends_with("-SWAP") {
-        okx::InstType::Swap
+/// Build a one-call [`DataRequest`] for `symbol`, honouring a `--base-url` override
+/// (empty → the venue's built-in default).
+fn request_for(cfg: &Config, venue: Venue, symbol: &str) -> DataRequest {
+    let req = DataRequest::new(venue, symbol, &cfg.interval, cfg.start, cfg.end);
+    if cfg.base_url.is_empty() {
+        req
     } else {
-        okx::InstType::Spot
+        req.with_base_url(&cfg.base_url)
+    }
+}
+
+/// Total size (bytes) of the cached `.feather` chunks in `dir` — the on-disk footprint
+/// for the range-aware cache (one or more chunk files per series, plus the manifest).
+fn cache_footprint(dir: &std::path::Path) -> u64 {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
     };
-    let mut transport = okx::ReqwestTransport::new()?;
-    eprintln!("[okx] instruments ({}) ...", inst_type.query());
-    let catalog = okx::OkxCatalog::fetch(&mut transport, &cfg.base_url, inst_type)?;
-    let instrument = catalog
-        .id_of(&cfg.symbol)
-        .ok_or("okx instId not present / not live (try e.g. BTC-USDT-SWAP)")?;
-    let (price_scale, qty_scale) = catalog.scales(instrument).ok_or("no scales")?;
-    let bar_ms = interval_ms(&cfg.interval)?;
-    let (base, sym, iv, start, end) = (
-        cfg.base_url.clone(),
-        cfg.symbol.clone(),
-        cfg.interval.clone(),
-        cfg.start,
-        cfg.end,
-    );
+    rd.flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            (p.extension().is_some_and(|x| x == "feather"))
+                .then(|| e.metadata().ok().map_or(0, |m| m.len()))
+        })
+        .sum()
+}
+
+/// Feature demo: gap-fill several symbols **concurrently** through
+/// [`akadro::data::load_many`] (rate-limited per venue), reporting per-symbol bar
+/// counts and the wall time. Exercises the concurrent multi-series cache path.
+fn demo_load_many(cfg: &Config, venue: Venue, cache_dir: &std::path::Path) {
+    let symbols: Vec<&str> = cfg
+        .symbols
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let reqs: Vec<DataRequest> = symbols.iter().map(|s| request_for(cfg, venue, s)).collect();
+    // Opt into concurrency (default is sequential): one worker per symbol, capped at 4.
+    let mut opts = CacheOptions::default();
+    opts.concurrency = symbols.len().clamp(1, 4);
     eprintln!(
-        "[okx] {} {} via history-candles (cache or download; ~{} pages for a day of 1s) ...",
-        cfg.symbol,
+        "[{}] concurrent load_many: {} symbols {} at concurrency {} ...",
+        cfg.venue,
+        reqs.len(),
         cfg.interval,
-        (end - start) / bar_ms / 100
+        opts.concurrency
     );
-    let bars = load_or_cache(cache_path, instrument, price_scale, qty_scale, move || {
-        okx::OkxCandleFeed::new(
-            okx::ReqwestTransport::new().expect("transport"),
-            base,
-            sym,
-            instrument,
-            iv,
-            price_scale,
-            qty_scale,
+    let t0 = std::time::Instant::now();
+    let results = akadro::data::load_many(&reqs, &opts, cache_dir);
+    let dt = t0.elapsed();
+    println!(
+        "\n=========  concurrent multi-symbol load ({})  =========",
+        cfg.venue
+    );
+    for (sym, res) in symbols.iter().zip(&results) {
+        match res {
+            Ok(m) => println!(
+                "  {sym:<14} {:>6} bars   instrument {:?}   scales ({}, {})",
+                m.bars.len(),
+                m.instrument,
+                m.price_scale,
+                m.qty_scale
+            ),
+            Err(e) => println!("  {sym:<14} ERROR: {e}"),
+        }
+    }
+    println!("  wall time: {dt:?} (downloads ran concurrently, rate-limited)");
+    println!("=========================================================\n");
+}
+
+/// Feature demo: load the requested (coarse) `--interval` by **aggregating** a cached
+/// finer interval through [`akadro::data::load_aggregated`], comparing the rolled-up
+/// bars against a direct download of the native coarse interval. Exercises the
+/// multi-timeframe cache path.
+fn demo_aggregate(
+    cfg: &Config,
+    req: &DataRequest,
+    opts: &CacheOptions,
+    cache_dir: &std::path::Path,
+) -> Result<(), Err> {
+    eprintln!(
+        "[{}] aggregating {} -> {} for {} (download finer, roll up) ...",
+        cfg.venue, cfg.aggregate_from, cfg.interval, cfg.symbol
+    );
+    let agg = akadro::data::load_aggregated(req, &cfg.aggregate_from, opts, cache_dir)?;
+    // Cross-check against a direct download of the venue's native coarse bars.
+    let direct = load(req, opts, cache_dir)?;
+    let same_open =
+        agg.bars.first().map(|b| b.open.raw()) == direct.bars.first().map(|b| b.open.raw());
+    let same_close =
+        agg.bars.last().map(|b| b.close.raw()) == direct.bars.last().map(|b| b.close.raw());
+    println!(
+        "\n=========  multi-timeframe aggregation ({} {})  =========",
+        cfg.venue, cfg.symbol
+    );
+    println!(
+        "  aggregated {} -> {}: {} coarse bars (rolled up from cached {} data)",
+        cfg.aggregate_from,
+        cfg.interval,
+        agg.bars.len(),
+        cfg.aggregate_from
+    );
+    println!(
+        "  direct {} download    : {} coarse bars",
+        cfg.interval,
+        direct.bars.len()
+    );
+    println!("  edges match direct    : first-open {same_open}, last-close {same_close}");
+    println!("=========================================================\n");
+    Ok(())
+}
+
+/// Parse a comma-separated `usize` list, falling back to `default` when empty/blank.
+fn usize_list(s: &str, default: &[usize]) -> Vec<usize> {
+    if s.trim().is_empty() {
+        return default.to_vec();
+    }
+    s.split(',')
+        .filter_map(|x| x.trim().parse::<usize>().ok())
+        .collect()
+}
+
+/// The SMA `(fast, slow)` candidate grid (fast &lt; slow) — the trial set shared by the
+/// walk-forward in-sample optimisation and the overfitting analysis. Tunable via
+/// `--grid-fast` / `--grid-slow` (fewer/narrower trials reduce selection bias).
+fn sma_candidates(cfg: &Config) -> Vec<(usize, usize)> {
+    let fasts = usize_list(&cfg.grid_fast, &[5, 10, 20, 50]);
+    let slows = usize_list(&cfg.grid_slow, &[20, 50, 100, 200]);
+    let mut v = Vec::new();
+    for &f in &fasts {
+        for &s in &slows {
+            if f < s {
+                v.push((f, s));
+            }
+        }
+    }
+    v
+}
+
+/// In-sample objective for the walk-forward fit: the total return of SMA `(fast, slow)`
+/// over the **train** slice only. Built from the *exact same* `FillConfig` the
+/// framework uses out-of-sample (`SimulatedExchange::with_config`), so IS and OOS share
+/// one fill model bit-for-bit (fees, cash, slippage, impact, latency, participation) —
+/// no config drift. An invalid pairing, too-short train, or a blow-up scores
+/// `NEG_INFINITY` so it is never selected.
+#[allow(clippy::too_many_arguments)]
+fn wf_is_return(
+    train: &[Bar],
+    fast: usize,
+    slow: usize,
+    specs: &[InstrumentSpec],
+    instrument: InstrumentId,
+    cash_raw: i128,
+    fill: FillConfig,
+    deploy_pct: i64,
+    ppy: f64,
+) -> f64 {
+    if fast >= slow || train.len() <= slow {
+        return f64::NEG_INFINITY;
+    }
+    let strategy = SmaCrossover::new(instrument, fast, slow, deploy_pct);
+    let exchange = SimulatedExchange::with_config(specs.to_vec(), fill);
+    let Ok(engine) = Engine::new(
+        specs,
+        Money::from_raw(cash_raw),
+        HistoricalFeed::from_bars(train.to_vec()),
+        exchange,
+        strategy,
+    ) else {
+        return f64::NEG_INFINITY;
+    };
+    let report = engine.run();
+    PerformanceReport::from_equity(&report.equity_curve, ppy)
+        .map_or(f64::NEG_INFINITY, |p| p.total_return)
+}
+
+/// Feature demo: a **structural walk-forward analysis** (`akadro-analytics` +
+/// `akadro-backtest`). For each rolling fold the `fit` step grid-searches SMA
+/// `(fast, slow)` on the **in-sample** train slice only (parallel via `run_grid`) and
+/// the framework evaluates the chosen params **out-of-sample** — the test slice is
+/// structurally invisible to `fit`, so there is no look-ahead and no select-by-OOS. The
+/// per-fold OOS reports are pooled into a [`WalkForwardSummary`] (pooled *returns*, not
+/// stitched equity) with walk-forward efficiency. Spot only.
+// Long but linear (load → windows → fit/run → report); FillConfig is `#[non_exhaustive]`
+// so it must be mutated after `default()` (no cross-crate struct literal).
+#[allow(clippy::too_many_lines, clippy::field_reassign_with_default)]
+fn demo_walk_forward(
+    cfg: &Config,
+    venue: Venue,
+    req: &DataRequest,
+    opts: &CacheOptions,
+    cache_dir: &std::path::Path,
+) -> Result<(), Err> {
+    if venue.is_perp(&cfg.symbol) {
+        return Err(
+            "walk-forward demo is spot-only (a perp needs a funding schedule the \
+                    structural runner's FillConfig doesn't carry)"
+                .into(),
+        );
+    }
+    let bar_ms = interval_ms(&cfg.interval)?;
+    let ppy = 365.0 * 86_400_000.0 / bar_ms as f64;
+    eprintln!(
+        "[{}] walk-forward: loading {} {} bars ...",
+        cfg.venue, cfg.symbol, cfg.interval
+    );
+    let market = load(req, opts, cache_dir)?;
+    let bars = market.bars;
+    let (instrument, specs) = (market.instrument, market.specs);
+    let money_scale = market.price_scale + market.qty_scale;
+    let cash_raw = cfg.cash * 10i128.pow(money_scale);
+    if bars.len() < cfg.wf_train + cfg.wf_test {
+        return Err(format!(
+            "not enough bars ({}) for walk-forward (need >= train {} + test {}); widen the window",
+            bars.len(),
+            cfg.wf_train,
+            cfg.wf_test
         )
-        .with_range(start, end)
-    })?;
-    Ok((
-        catalog.specs().to_vec(),
-        instrument,
-        price_scale,
-        qty_scale,
-        bars,
-    ))
+        .into());
+    }
+
+    // Rolling windows in close-stamp nanoseconds (the cache stamps bars at close-ns).
+    let bar_width_ns = bar_ms * 1_000_000;
+    let start = bars.first().expect("non-empty").ts;
+    let end = bars.last().expect("non-empty").ts;
+    let windows = walk_forward(
+        start,
+        end,
+        cfg.wf_train as i64 * bar_width_ns,
+        cfg.wf_test as i64 * bar_width_ns,
+        cfg.wf_step.max(1) as i64 * bar_width_ns,
+    );
+    if windows.is_empty() {
+        return Err("no walk-forward windows (train+test span exceeds the data)".into());
+    }
+
+    // One fill config — fee, cash, and the same fill-realism knobs the main backtest
+    // honours — reused verbatim for BOTH the in-sample fit and the out-of-sample run, so
+    // there is no config drift between IS and OOS.
+    let mut fill = FillConfig::default();
+    fill.fee_bps = cfg.fee_bps;
+    if cfg.enforce_cash {
+        fill.starting_cash = Some(cash_raw);
+    }
+    if cfg.slippage_bps > 0 {
+        fill.slippage_bps = cfg.slippage_bps;
+    }
+    if cfg.impact_bps > 0 {
+        fill.impact_bps = cfg.impact_bps;
+    }
+    if cfg.latency_bars > 0 {
+        fill.latency_bars = cfg.latency_bars;
+    }
+    if cfg.participation_bps > 0 {
+        fill.max_participation_bps = Some(cfg.participation_bps);
+    }
+
+    // In-sample optimisation grid: SMA (fast, slow) candidates (fast < slow).
+    let candidates = sma_candidates(cfg);
+    eprintln!(
+        "[{}] walk-forward: {} folds, {} IS candidates/fold (train {} / test {} / step {} bars) ...",
+        cfg.venue,
+        windows.len(),
+        candidates.len(),
+        cfg.wf_train,
+        cfg.wf_test,
+        cfg.wf_step
+    );
+
+    let wf = WalkForwardBacktest::new(&specs, Money::from_raw(cash_raw), fill, &bars, &windows);
+    let deploy = cfg.deploy_pct;
+    let specs_ref = &specs;
+    let cand = &candidates;
+    let (folds, fit_log) = wf
+        .run(
+            Vec::<(usize, usize, f64)>::new(),
+            |train: &[Bar], st: &mut Vec<(usize, usize, f64)>| {
+                // IS grid search (parallel via run_grid) — the train slice ONLY.
+                let cells: Vec<_> = cand
+                    .iter()
+                    .map(|&(f, s)| {
+                        move || {
+                            wf_is_return(
+                                train, f, s, specs_ref, instrument, cash_raw, fill, deploy, ppy,
+                            )
+                        }
+                    })
+                    .collect();
+                let scores = run_grid(cells);
+                let best = scores
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map_or(0, |(i, _)| i);
+                let (f, s) = cand[best];
+                st.push((f, s, scores[best]));
+                (f, s)
+            },
+            |&(f, s): &(usize, usize)| SmaCrossover::new(instrument, f, s, deploy),
+        )
+        .map_err(|e| -> Err { format!("walk-forward run: {e}").into() })?;
+
+    // Pool the per-fold OOS reports (pooled returns, not stitched equity) + WFE.
+    let oos_reports: Vec<RunReport> = folds.iter().map(|fold| fold.report.clone()).collect();
+    let mean_is: f64 = if fit_log.is_empty() {
+        0.0
+    } else {
+        fit_log.iter().map(|&(_, _, r)| r).sum::<f64>() / fit_log.len() as f64
+    };
+    let summary = WalkForwardSummary::from_reports(&oos_reports, ppy, Some(mean_is));
+
+    println!(
+        "\n=========  walk-forward analysis ({} {} {})  =========",
+        cfg.venue, cfg.symbol, cfg.interval
+    );
+    println!(
+        "  {:>4}  {:>15}  {:>9}  {:>9}  {:>9}",
+        "fold", "OOS start (ns)", "params", "OOS ret%", "OOS Shrp"
+    );
+    for (i, (fold, &(f, s, _is))) in folds.iter().zip(&fit_log).enumerate() {
+        let oos = PerformanceReport::from_equity(&fold.report.equity_curve, ppy);
+        let (ret, shrp) = oos.map_or((f64::NAN, f64::NAN), |p| (p.total_return * 100.0, p.sharpe));
+        println!(
+            "  {:>4}  {:>15}  {:>4}/{:<4}  {:>9.2}  {:>9.3}",
+            i + 1,
+            fold.window.test_start.as_nanos(),
+            f,
+            s,
+            ret,
+            shrp
+        );
+    }
+    println!("  ---- pooled out-of-sample (WalkForwardSummary) ----");
+    println!(
+        "  folds: {} ({} measured, {} unmeasurable/blow-up), pooled OOS periods: {}",
+        summary.folds, summary.measured_folds, summary.unmeasurable_folds, summary.pooled_periods
+    );
+    if let Some(p) = &summary.pooled {
+        println!(
+            "  pooled OOS: return {:.2}%  Sharpe {:.3}  Sortino {:.3}  maxDD {:.2}%",
+            p.total_return * 100.0,
+            p.sharpe,
+            p.sortino,
+            p.max_drawdown * 100.0
+        );
+    } else {
+        println!("  pooled OOS: NOT COMPUTABLE (a fold blew up / too few points)");
+    }
+    match summary.efficiency {
+        Some(wfe) => println!(
+            "  walk-forward efficiency (pooled OOS / mean IS return): {wfe:.3}  \
+             (>1 = OOS beat IS; <1 = the usual overfit degradation)"
+        ),
+        None => println!("  walk-forward efficiency: n/a (non-positive in-sample return)"),
+    }
+    println!(
+        "  mean in-sample return of the fitted params: {:.2}%",
+        mean_is * 100.0
+    );
+    println!("=========================================================\n");
+    Ok(())
 }
 
-/// Fetch OKX funding-rate history for the perp and turn it into a
-/// `(schedule, interval_bars)` for `SimulatedExchange::with_funding_schedule`.
-/// The settlement cadence (8h on most OKX perps, 4h on some) is derived from the
-/// gaps between settlements; `interval_bars` is that period expressed in `bar_ms`
-/// bars, so funding accrues at the right rhythm for any interval.
-fn okx_funding(cfg: &Config, bar_ms: i64) -> Result<(Vec<(Timestamp, i64)>, u32), Err> {
-    let mut transport = okx::ReqwestTransport::new()?;
-    let schedule = okx::fetch_funding_history(&mut transport, &cfg.base_url, &cfg.symbol, 100)?;
-    // Period (8h on most OKX perps, 4h on some) → `interval_bars` for the engine.
-    let period_ms = infer_funding_period_ms(&schedule);
-    let interval_bars = u32::try_from((period_ms / bar_ms).max(1)).unwrap_or(u32::MAX);
-    Ok((schedule, interval_bars))
+/// Per-bar return series of SMA `(fast, slow)` over the **full** window — one trial /
+/// one column of the overfitting analysis. Empty on an invalid pairing or a blow-up
+/// (the caller drops short series so every trial shares one length `T`).
+#[allow(clippy::too_many_arguments)]
+fn full_window_returns(
+    bars: &[Bar],
+    fast: usize,
+    slow: usize,
+    specs: &[InstrumentSpec],
+    instrument: InstrumentId,
+    cash_raw: i128,
+    fill: FillConfig,
+    deploy_pct: i64,
+) -> Vec<f64> {
+    if fast >= slow || bars.len() <= slow {
+        return Vec::new();
+    }
+    let strategy = SmaCrossover::new(instrument, fast, slow, deploy_pct);
+    let exchange = SimulatedExchange::with_config(specs.to_vec(), fill);
+    let Ok(engine) = Engine::new(
+        specs,
+        Money::from_raw(cash_raw),
+        HistoricalFeed::from_bars(bars.to_vec()),
+        exchange,
+        strategy,
+    ) else {
+        return Vec::new();
+    };
+    returns_from_equity(&engine.run().equity_curve).unwrap_or_default()
 }
 
-/// Fetch MEXC perpetual funding-rate history (paged to cover the backtest window)
-/// and turn it into a `(schedule, interval_bars)` for `with_funding_schedule`.
-/// MEXC pages 100 settlements (~33 days at 8h) each, so a year needs ~11 pages.
-fn mexc_futures_funding(cfg: &Config, bar_ms: i64) -> Result<(Vec<(Timestamp, i64)>, u32), Err> {
-    let mut transport = ReqwestTransport::new()?;
-    // ~3 settlements/day (8h cadence), 100 per page → pages to span the window + margin.
-    let days = ((cfg.end - cfg.start).max(0) / 86_400_000) + 1;
-    let pages = u32::try_from((days * 3 / 100) + 2).unwrap_or(2);
-    let schedule = mexc::fetch_funding_history_paged(
-        &mut transport,
-        mexc::FUTURES_BASE_URL,
-        &cfg.symbol,
-        pages,
-    )?;
-    // Settlement period (smallest positive gap, 8h fallback) → engine interval_bars,
-    // via the same venue-neutral inference the OKX path uses (DRY, m48).
-    let period_ms = infer_funding_period_ms(&schedule);
-    let interval_bars = u32::try_from((period_ms / bar_ms).max(1)).unwrap_or(u32::MAX);
-    Ok((schedule, interval_bars))
+/// Feature demo: an **overfitting analysis** over the SMA grid — the Bailey–López de
+/// Prado pair. **Deflated Sharpe** discounts the best trial's Sharpe for having been
+/// chosen among many (multiple-testing bias); **PBO** (Probability of Backtest
+/// Overfitting, via the library's CSCV `probability_of_backtest_overfitting`) is the
+/// chance the in-sample winner is no better than the median out-of-sample. Spot only.
+// FillConfig is `#[non_exhaustive]` → mutate after `default()` (no cross-crate literal).
+#[allow(clippy::field_reassign_with_default, clippy::too_many_lines)]
+fn demo_overfit(
+    cfg: &Config,
+    venue: Venue,
+    req: &DataRequest,
+    opts: &CacheOptions,
+    cache_dir: &std::path::Path,
+) -> Result<(), Err> {
+    if venue.is_perp(&cfg.symbol) {
+        return Err("overfit demo is spot-only".into());
+    }
+    eprintln!(
+        "[{}] overfit analysis: loading {} {} bars ...",
+        cfg.venue, cfg.symbol, cfg.interval
+    );
+    let market = load(req, opts, cache_dir)?;
+    let bars = market.bars;
+    let (instrument, specs) = (market.instrument, market.specs);
+    let money_scale = market.price_scale + market.qty_scale;
+    let cash_raw = cfg.cash * 10i128.pow(money_scale);
+
+    let mut fill = FillConfig::default();
+    fill.fee_bps = cfg.fee_bps;
+    if cfg.enforce_cash {
+        fill.starting_cash = Some(cash_raw);
+    }
+
+    let candidates = sma_candidates(cfg);
+    eprintln!(
+        "[{}] overfit analysis: running {} SMA trials over {} bars ...",
+        cfg.venue,
+        candidates.len(),
+        bars.len()
+    );
+    // One full-window backtest per trial (parallel) → the per-strategy return matrix.
+    let bars_ref = &bars;
+    let specs_ref = &specs;
+    let deploy = cfg.deploy_pct;
+    let cells: Vec<_> = candidates
+        .iter()
+        .map(|&(f, s)| {
+            move || {
+                full_window_returns(
+                    bars_ref, f, s, specs_ref, instrument, cash_raw, fill, deploy,
+                )
+            }
+        })
+        .collect();
+    let all_returns = run_grid(cells);
+
+    // Keep only trials that produced the full-length series (drop invalid/blow-up).
+    let t_full = all_returns.iter().map(Vec::len).max().unwrap_or(0);
+    let trials: Vec<(usize, &Vec<f64>)> = candidates
+        .iter()
+        .zip(&all_returns)
+        .enumerate()
+        .filter(|(_, (_, r))| r.len() == t_full && t_full > 0)
+        .map(|(i, (_, r))| (i, r))
+        .collect();
+    if trials.len() < 2 {
+        return Err(
+            "not enough valid trials for an overfitting analysis (widen the window)".into(),
+        );
+    }
+    let matrix: Vec<Vec<f64>> = trials.iter().map(|(_, r)| (*r).clone()).collect();
+
+    // Per-trial per-period Sharpe → the selected (best) trial + the trial-Sharpe spread.
+    let sharpes: Vec<f64> = matrix.iter().map(|r| per_period_sharpe(r)).collect();
+    let best = sharpes
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map_or(0, |(i, _)| i);
+    let (best_fast, best_slow) = candidates[trials[best].0];
+    let n_trials = matrix.len();
+    let n = t_full;
+    let mean_sr = sharpes.iter().sum::<f64>() / n_trials as f64;
+    let sr_variance = sharpes.iter().map(|s| (s - mean_sr).powi(2)).sum::<f64>()
+        / (n_trials as f64 - 1.0).max(1.0);
+    let sr = sharpes[best];
+    let skew = skewness(&matrix[best]);
+    let kurt = kurtosis(&matrix[best]);
+    let dsr = deflated_sharpe(sr, sr_variance, n_trials, n, skew, kurt);
+    let psr = probabilistic_sharpe(sr, 0.0, n, skew, kurt);
+    let e_max = expected_max_sharpe_z(n_trials);
+
+    // PBO via the library's CSCV.
+    let pbo = probability_of_backtest_overfitting(&matrix, cfg.pbo_groups);
+
+    println!(
+        "\n=========  overfitting analysis ({} {} {})  =========",
+        cfg.venue, cfg.symbol, cfg.interval
+    );
+    println!("  trials: {n_trials} SMA (fast,slow) over {n} per-bar returns");
+    println!(
+        "  per-trial per-period Sharpe: best {best_fast}/{best_slow} SR={sr:.4}  (mean {mean_sr:.4}, σ {:.4})",
+        sr_variance.sqrt()
+    );
+    println!("  ---- Deflated Sharpe (multiple-testing correction) ----");
+    println!("  E[max SR | {n_trials} trials] : {e_max:.4}  (the bar a lucky pick must clear)");
+    println!(
+        "  naive PSR (true SR > 0)      : {:.1}%  (no selection correction)",
+        psr * 100.0
+    );
+    println!(
+        "  Deflated SR (true SR > 0)    : {:.1}%  (after correcting for {n_trials} trials)  [low ⇒ likely a fluke]",
+        dsr * 100.0
+    );
+    println!("  ---- Probability of Backtest Overfitting (CSCV) ----");
+    match pbo {
+        Some(r) => println!(
+            "  PBO: {:.1}%  ({} groups, {} splits)  [near 0 ⇒ selection generalises; near 1 ⇒ overfit]",
+            r.pbo * 100.0,
+            cfg.pbo_groups,
+            r.splits
+        ),
+        None => println!(
+            "  PBO: n/a (need an even pbo-groups in 2..=returns, ≥2 trials; got groups={})",
+            cfg.pbo_groups
+        ),
+    }
+    println!("=========================================================\n");
+    Ok(())
 }
 
 /// Diagnostic A/B: run the SAME bars through the engine as `Spot` then as
@@ -585,6 +1044,16 @@ fn bench_kind_ab(
         for _ in 0..runs {
             let strategy = SmaCrossover::new(instrument, cfg.fast, cfg.slow, cfg.deploy_pct);
             let mut exchange = SimulatedExchange::new(specs2.clone(), cfg.fee_bps);
+            if kind == InstrumentKind::PerpetualFuture {
+                // Funding is mandatory for a perp; a single zero-rate settlement
+                // satisfies that while charging nothing, so the A/B isolates only the
+                // instrument-kind per-bar cost (no funding noise).
+                exchange = exchange.with_funding_schedule(
+                    instrument,
+                    1,
+                    vec![(Timestamp::from_nanos(0), 0)],
+                );
+            }
             if cfg.enforce_cash {
                 exchange = exchange.with_starting_cash(Money::from_raw(cash_raw));
             }
@@ -663,23 +1132,68 @@ fn main() -> Result<(), Err> {
     let periods_per_year = 365.0 * 86_400_000.0 / bar_ms as f64;
     eprintln!("config: {cfg:?}");
 
-    // 1 + 2. Resolve the instrument and download-and-cache (or load) the candles
-    //    for the chosen venue. Cached under a local `market_data/` dir (git-ignored),
-    //    keyed by venue + symbol + interval + range so windows don't collide.
+    // 1 + 2. Resolve the instrument and download-only-the-gaps (or replay) the candles
+    //    through the ONE-CALL `data::load` / `load_perp` surface: the range-aware,
+    //    resumable cache (keyed by venue+symbol+interval, NOT the window) does all the
+    //    plumbing — catalogue lookup, gap detection, incremental download, assembly.
+    //    For a perp it also fetches the mandatory funding schedule. Cached under a
+    //    local `market_data/` dir (git-ignored).
     let cache_dir = std::path::Path::new("market_data");
     std::fs::create_dir_all(cache_dir)?;
-    let cache_path = cache_dir.join(format!(
-        "{}_{}_{}_{}_{}.feather",
-        cfg.venue, cfg.symbol, cfg.interval, cfg.start, cfg.end
-    ));
-    let (specs, instrument, price_scale, qty_scale, bars) = match cfg.venue.as_str() {
-        "okx" => load_okx(&cfg, &cache_path)?,
-        "mexc" => load_mexc(&cfg, &cache_path)?,
-        "mexc-futures" => load_mexc_futures(&cfg, &cache_path)?,
-        other => {
-            return Err(format!("unknown venue '{other}' (mexc|mexc-futures|okx)").into());
-        }
-    };
+    let venue = venue_of(&cfg)?;
+    let req = request_for(&cfg, venue, &cfg.symbol);
+    let opts = CacheOptions::default();
+
+    // Feature demo: concurrent multi-symbol gap-fill via `data::load_many`, then exit.
+    if !cfg.symbols.is_empty() {
+        demo_load_many(&cfg, venue, cache_dir);
+        return Ok(());
+    }
+    // Feature demo: multi-timeframe aggregation via `data::load_aggregated`, then exit.
+    if !cfg.aggregate_from.is_empty() {
+        return demo_aggregate(&cfg, &req, &opts, cache_dir);
+    }
+    // Feature demo: structural walk-forward analysis (akadro-analytics + akadro-backtest).
+    if cfg.walk_forward {
+        return demo_walk_forward(&cfg, venue, &req, &opts, cache_dir);
+    }
+    // Feature demo: overfitting analysis (Deflated Sharpe + PBO/CSCV) over the SMA grid.
+    if cfg.overfit {
+        return demo_overfit(&cfg, venue, &req, &opts, cache_dir);
+    }
+
+    let (specs, instrument, price_scale, qty_scale, bars, funding_sched, funding_interval) =
+        if venue.is_perp(&cfg.symbol) {
+            let pm = load_perp(&req, &opts, cache_dir)?;
+            eprintln!(
+                "[{}] funding: {} settlements (cache or download), accruing every {} bars (~{}h)",
+                cfg.venue,
+                pm.funding_schedule.len(),
+                pm.funding_interval_bars,
+                i64::from(pm.funding_interval_bars) * bar_ms / 3_600_000
+            );
+            let m = pm.market;
+            (
+                m.specs,
+                m.instrument,
+                m.price_scale,
+                m.qty_scale,
+                m.bars,
+                pm.funding_schedule,
+                pm.funding_interval_bars,
+            )
+        } else {
+            let m = load(&req, &opts, cache_dir)?;
+            (
+                m.specs,
+                m.instrument,
+                m.price_scale,
+                m.qty_scale,
+                m.bars,
+                Vec::new(),
+                0u32,
+            )
+        };
     let money_scale = price_scale + qty_scale;
     assert!(!bars.is_empty(), "no bars returned");
     let first = &bars[0];
@@ -702,13 +1216,14 @@ fn main() -> Result<(), Err> {
 
     // Diagnostic: interleave two datasets in ONE process (removes machine drift).
     if !cfg.bench_vs.is_empty() {
-        let mut cfg_b = cfg.clone();
-        cfg_b.symbol.clone_from(&cfg.bench_vs);
-        let cache_b = cache_dir.join(format!(
-            "{}_{}_{}_{}_{}.feather",
-            cfg_b.venue, cfg_b.symbol, cfg_b.interval, cfg_b.start, cfg_b.end
-        ));
-        let b = load_okx(&cfg_b, &cache_b)?;
+        let mb = load(&request_for(&cfg, venue, &cfg.bench_vs), &opts, cache_dir)?;
+        let b: Market = (
+            mb.specs,
+            mb.instrument,
+            mb.price_scale,
+            mb.qty_scale,
+            mb.bars,
+        );
         let a: Market = (
             specs.clone(),
             instrument,
@@ -723,47 +1238,8 @@ fn main() -> Result<(), Err> {
     //    turbo takes tens of ms to ramp and the i-cache/branch-predictor start cold,
     //    so the first run understates steady-state throughput. We rebuild the engine
     //    each iteration (the rebuild + `bars.clone()` are OUTSIDE the timed region)
-    //    and report the fastest run as the representative figure.
-    // Perpetual funding: for an OKX swap, pull the venue's funding-rate history and
-    // accrue it on the held position (longs pay shorts when the rate is positive).
-    // Empty for spot / MEXC / when disabled, in which case funding stays 0.
-    let (funding_sched, funding_interval) = if cfg.funding
-        && cfg.venue == "okx"
-        && cfg.symbol.ends_with("-SWAP")
-    {
-        match okx_funding(&cfg, bar_ms) {
-            Ok((s, iv)) => {
-                eprintln!(
-                    "[okx] funding: {} settlements loaded, accruing every {iv} bars (~{}h)",
-                    s.len(),
-                    iv as i64 * bar_ms / 3_600_000
-                );
-                (s, iv)
-            }
-            Err(e) => {
-                eprintln!("[okx] funding fetch failed ({e}); running with funding = 0");
-                (Vec::new(), 0)
-            }
-        }
-    } else if cfg.funding && cfg.venue == "mexc-futures" {
-        match mexc_futures_funding(&cfg, bar_ms) {
-            Ok((s, iv)) => {
-                eprintln!(
-                    "[mexc-futures] funding: {} settlements loaded, accruing every {iv} bars (~{}h)",
-                    s.len(),
-                    iv as i64 * bar_ms / 3_600_000
-                );
-                (s, iv)
-            }
-            Err(e) => {
-                eprintln!("[mexc-futures] funding fetch failed ({e}); running with funding = 0");
-                (Vec::new(), 0)
-            }
-        }
-    } else {
-        (Vec::new(), 0)
-    };
-
+    //    and report the fastest run as the representative figure. Funding (mandatory,
+    //    cache-backed) was already resolved by `load_perp` above for a perp.
     let runs = cfg.repeat.max(1);
     let (report, backtest_time) = {
         let mut best: Option<(RunReport, std::time::Duration)> = None;
@@ -772,6 +1248,19 @@ fn main() -> Result<(), Err> {
             let mut exchange = SimulatedExchange::new(specs.clone(), cfg.fee_bps);
             if cfg.enforce_cash {
                 exchange = exchange.with_starting_cash(Money::from_raw(cash_raw));
+            }
+            // Opt-in fill realism (each defaults to the conservative no-op).
+            if cfg.slippage_bps > 0 {
+                exchange = exchange.with_slippage_bps(cfg.slippage_bps);
+            }
+            if cfg.impact_bps > 0 {
+                exchange = exchange.with_impact_model(cfg.impact_bps);
+            }
+            if cfg.latency_bars > 0 {
+                exchange = exchange.with_latency_bars(cfg.latency_bars);
+            }
+            if cfg.participation_bps > 0 {
+                exchange = exchange.with_participation_bps(cfg.participation_bps);
             }
             if !funding_sched.is_empty() {
                 exchange = exchange.with_funding_schedule(
@@ -806,8 +1295,9 @@ fn main() -> Result<(), Err> {
         best.expect("runs >= 1")
     };
 
-    // 5. The candles are already cached on disk by `load_or_cache` above.
-    let on_disk = std::fs::metadata(&cache_path)?.len();
+    // 5. The candles are already cached on disk by the gap-fill loader above (one or
+    //    more LZ4 `.feather` chunks per series under `market_data/`).
+    let on_disk = cache_footprint(cache_dir);
 
     // 6. Analytics + report.
     let perf = PerformanceReport::from_equity(&report.equity_curve, periods_per_year);
@@ -899,6 +1389,16 @@ fn main() -> Result<(), Err> {
         quote(cash_raw, money_scale),
         quote(final_eq, money_scale)
     );
+    // Buy-and-hold benchmark over the SAME window (full cash in at the first close,
+    // held to the last) — separates strategy timing from the asset's secular drift.
+    let bh_mult = last.close.raw() as f64 / first.close.raw() as f64;
+    let bh_final_raw = (cash_raw as f64 * bh_mult) as i128;
+    println!(
+        "  buy & hold       : ~{:.2}  ({:+.2}%, {bh_mult:.1}x)  |  strategy / B&H = {:.2}x",
+        quote(bh_final_raw, money_scale),
+        (bh_mult - 1.0) * 100.0,
+        final_eq as f64 / bh_final_raw as f64
+    );
     println!(
         "  realized PnL     : ~{:.2}   trading fees ~{:.2}  funding ~{:.2}",
         quote(report.realized_pnl.raw(), money_scale),
@@ -926,10 +1426,10 @@ fn main() -> Result<(), Err> {
         );
     }
     println!(
-        "  data on disk     : {} bytes ({:.0} KiB) at {}",
+        "  data on disk     : {} bytes ({:.0} KiB) in {}",
         on_disk,
         on_disk as f64 / 1024.0,
-        cache_path.display()
+        cache_dir.display()
     );
     if !cfg.save_report.is_empty() {
         // All reports land under `run_artefacts/` (created on demand, git-ignored).

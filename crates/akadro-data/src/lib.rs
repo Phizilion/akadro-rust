@@ -22,8 +22,15 @@
 //! crate would be the sole place `unsafe` is permitted.
 
 mod bars;
+mod concurrent;
+mod funding;
+mod gap;
+mod incremental;
+mod load;
 mod manifest;
 mod merge;
+mod perp;
+mod ratelimit;
 mod signal;
 mod trades;
 
@@ -32,7 +39,14 @@ pub use bars::{
     load_or_cache_feed, load_or_cache_many, load_or_cache_many_feed, read_partition,
     write_partition,
 };
-pub use manifest::{CacheEntry, Manifest};
+pub use concurrent::{SeriesRequest, load_many};
+pub use funding::{load_or_cache_funding, read_funding_partition, write_funding_partition};
+pub use gap::missing_gaps;
+pub use incremental::FlushPolicy;
+pub use load::{CacheOptions, SeriesKey, load_bars, load_bars_aggregated, load_bars_feed};
+pub use manifest::{CacheEntry, Coverage, Manifest};
 pub use merge::MergeSource;
+pub use perp::{CachedPerp, load_or_cache_perp};
+pub use ratelimit::{RateLimiter, default_req_per_sec};
 pub use signal::SignalSource;
-pub use trades::{bars_from_trades, interval_to_nanos};
+pub use trades::{aggregate_bars, aggregate_bars_checked, bars_from_trades, interval_to_nanos};

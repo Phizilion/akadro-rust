@@ -53,7 +53,9 @@ impl Atr {
                 self.tr_sum += i128::from(true_range);
                 self.count += 1;
                 if self.count == self.period {
-                    let seed = (self.tr_sum / self.period as i128) as i64;
+                    // Clamp on the narrow back (never a bare `as i64`); true ranges and
+                    // their mean are non-negative.
+                    let seed = i64::try_from(self.tr_sum / self.period as i128).unwrap_or(i64::MAX);
                     self.current = Some(seed);
                     Some(seed)
                 } else {
@@ -61,9 +63,11 @@ impl Atr {
                 }
             }
             Some(prev) => {
-                // Wilder smoothing, widened so `prev * (p-1)` cannot overflow (m31).
+                // Wilder smoothing, widened so `prev * (p-1)` cannot overflow (m31);
+                // clamp on the narrow back to match the try_from/clamp discipline.
                 let p = i128::from(self.period as i64);
-                let next = ((i128::from(prev) * (p - 1) + i128::from(true_range)) / p) as i64;
+                let next = i64::try_from((i128::from(prev) * (p - 1) + i128::from(true_range)) / p)
+                    .unwrap_or(i64::MAX);
                 self.current = Some(next);
                 Some(next)
             }

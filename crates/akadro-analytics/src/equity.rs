@@ -474,4 +474,64 @@ mod tests {
         // Unsorted -> can't infer -> None (does not fabricate a factor).
         assert!(PerformanceReport::from_equity_auto(&[pt(20, 100), pt(10, 110)]).is_none());
     }
+
+    #[test]
+    fn metrics_match_independent_closed_form() {
+        // Cross-validate against values derived BY HAND from the documented conventions
+        // (empyrical/QuantStats): Sharpe/volatility use sample variance (ddof=1);
+        // Sortino's downside deviation uses the population denominator (÷n); volatility
+        // and the ratios are annualized by √periods_per_year. Returns chosen so every
+        // figure is hand-computable.
+        let returns = [0.10, -0.05, 0.10, -0.05];
+        let ppy = 4.0; // annualization factor √4 = 2
+        let r = PerformanceReport::from_returns(&returns, ppy, 0.0, 0.0).unwrap();
+
+        // mean = 0.025; sample variance = 0.0225/3 = 0.0075; per-period σ = 0.08660254.
+        // volatility (annualized) = 0.08660254 × 2.
+        assert!(
+            (r.volatility - 0.173_205_08).abs() < 1e-7,
+            "vol {}",
+            r.volatility
+        );
+        // Sharpe = (mean/σ)×√ppy = (0.025/0.08660254)×2 = 0.57735027.
+        assert!(
+            (r.sharpe - 0.577_350_27).abs() < 1e-7,
+            "sharpe {}",
+            r.sharpe
+        );
+        // Downside dev (÷n, below 0) = √((0.0025+0.0025)/4) = 0.03535534.
+        // Sortino = (0.025/0.03535534)×2 = √2 (i.e. 2/√2).
+        assert!(
+            (r.sortino - std::f64::consts::SQRT_2).abs() < 1e-7,
+            "sortino {}",
+            r.sortino
+        );
+        // total return = (1.10·0.95)² − 1 = 0.092025; ann return = same (n = ppy).
+        assert!(
+            (r.total_return - 0.092_025).abs() < 1e-9,
+            "total {}",
+            r.total_return
+        );
+        assert!(
+            (r.annualized_return - 0.092_025).abs() < 1e-9,
+            "ann {}",
+            r.annualized_return
+        );
+        // max drawdown = 0.05 (each −5% step off the running peak).
+        assert!(
+            (r.max_drawdown - 0.05).abs() < 1e-9,
+            "maxdd {}",
+            r.max_drawdown
+        );
+        // Calmar = ann_return / maxDD = 0.092025 / 0.05 = 1.8405.
+        assert!((r.calmar - 1.8405).abs() < 1e-9, "calmar {}", r.calmar);
+
+        // The ddof=1 distinction is observable: the population-variance Sharpe would be
+        // (mean / σ_pop)×2 where σ_pop = √(0.0225/4) = 0.075 → 0.6666…, NOT 0.57735.
+        let sharpe_population = (0.025 / 0.075) * 2.0;
+        assert!(
+            (r.sharpe - sharpe_population).abs() > 0.08,
+            "Sharpe must use sample (ddof=1) variance, not population"
+        );
+    }
 }

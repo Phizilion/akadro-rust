@@ -48,8 +48,9 @@ impl Rsi {
             5000
         } else {
             // Widen: `10_000 * avg_gain` overflows i64 for large fixed-point gains
-            // (m31). The quotient is in `0..=10_000`, so the cast back is exact.
-            (10_000 * i128::from(self.avg_gain) / denom) as i64
+            // (m31). The quotient is in `0..=10_000`; clamp on narrowing (never a bare
+            // `as i64`) to match the indicator-wide try_from/clamp discipline.
+            i64::try_from(10_000 * i128::from(self.avg_gain) / denom).unwrap_or(i64::MAX)
         }
     }
 }
@@ -82,10 +83,13 @@ impl Indicator for Rsi {
             return None;
         }
 
-        // Wilder smoothing, widened so `avg * (p-1)` cannot overflow i64 (m31).
+        // Wilder smoothing, widened so `avg * (p-1)` cannot overflow i64 (m31); clamp
+        // (never a bare `as i64`) on the narrow back. Gains/losses are non-negative.
         let p = i128::from(self.period as i64);
-        self.avg_gain = ((i128::from(self.avg_gain) * (p - 1) + gain) / p) as i64;
-        self.avg_loss = ((i128::from(self.avg_loss) * (p - 1) + loss) / p) as i64;
+        self.avg_gain =
+            i64::try_from((i128::from(self.avg_gain) * (p - 1) + gain) / p).unwrap_or(i64::MAX);
+        self.avg_loss =
+            i64::try_from((i128::from(self.avg_loss) * (p - 1) + loss) / p).unwrap_or(i64::MAX);
         Some(self.level())
     }
 

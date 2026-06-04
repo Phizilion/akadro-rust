@@ -184,9 +184,44 @@ impl Cost {
     }
 }
 
-/// A bounded list of fill costs. Inline capacity 2 covers the common
-/// (single fee) and DEX (fee + gas) cases without allocating.
-pub type Costs = SmallVec<[Cost; 2]>;
+/// A bounded list of fill costs. Inline capacity 2 covers the common (single fee) and
+/// DEX (fee + gas) cases without allocating.
+///
+/// An **opaque newtype**, not a `SmallVec` alias, so the `smallvec` dependency stays out
+/// of akadro's public API (decision D13 — a `smallvec` major bump must not be a breaking
+/// change here). Build with [`Costs::new`] + [`Costs::push`]; read via the `Deref<[Cost]>`
+/// (`len`/`is_empty`/`first`/indexing/`iter`) or by iterating `&Costs`.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct Costs(SmallVec<[Cost; 2]>);
+
+impl Costs {
+    /// An empty cost list.
+    #[must_use]
+    pub fn new() -> Self {
+        Costs(SmallVec::new())
+    }
+
+    /// Append a cost component.
+    pub fn push(&mut self, cost: Cost) {
+        self.0.push(cost);
+    }
+}
+
+impl core::ops::Deref for Costs {
+    type Target = [Cost];
+    fn deref(&self) -> &[Cost] {
+        &self.0
+    }
+}
+
+impl<'a> IntoIterator for &'a Costs {
+    type Item = &'a Cost;
+    // `slice::Iter`, NOT `smallvec::IntoIter` — keeps the foreign type out of the API.
+    type IntoIter = core::slice::Iter<'a, Cost>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
 
 /// Why an order was rejected. Venue-neutral, closed-meaning set; venue-specific
 /// causes bucket into [`RejectReason::VenueRejected`].

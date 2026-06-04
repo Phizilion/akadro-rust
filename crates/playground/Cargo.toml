@@ -8,14 +8,19 @@ license.workspace = true
 publish = false
 
 [dependencies]
-# The umbrella (backtest is on by default) plus analytics, the data cache, and
-# serde (to save the run report to a file).
+# The umbrella (backtest on by default) plus analytics, the data cache, serde (save the
+# run report), and `venues` — the one-call `data::load`/`load_perp` venue dispatch, which
+# pulls in the MEXC + OKX connectors with their live `net` transports. The playground no
+# longer touches a venue crate directly: it asks `data::load` and gets ready bars.
 # import-bars: this scratch binary's A/B benches rebuild feeds from a reused Vec<Bar>;
-# the lab does NOT enable it. (The blessed path is data::load_or_cache_feed.)
-akadro = { path = "../akadro", features = ["analytics", "data", "serde", "import-bars"] }
-# The MEXC + OKX connectors with their real reqwest transports.
-akadro-venue-mexc = { path = "../akadro-venue-mexc", features = ["net"] }
-akadro-venue-okx = { path = "../akadro-venue-okx", features = ["net"] }
+# the lab does NOT enable it. (The blessed path is data::load_*.)
+akadro = { path = "../akadro", features = [
+    "analytics",
+    "data",
+    "serde",
+    "import-bars",
+    "venues",
+] }
 
 [lints]
 workspace = true

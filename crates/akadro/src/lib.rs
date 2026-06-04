@@ -56,8 +56,23 @@ pub use akadro_backtest as backtest;
 #[doc(inline)]
 pub use akadro_core as types;
 #[cfg(feature = "data")]
-#[doc(inline)]
-pub use akadro_data as data;
+pub mod data {
+    //! On-disk market-data cache. Re-exports all of [`akadro_data`] (the range-aware,
+    //! resumable bar cache: [`load_bars`], [`load_bars_feed`], [`load_many`],
+    //! [`SeriesKey`], [`CacheOptions`], …) and, with the `venues` feature, adds the
+    //! one-call venue dispatch [`load`] / [`load_perp`] so a caller goes straight from
+    //! *(venue, symbol, interval, window)* to ready bars.
+    #[doc(inline)]
+    pub use akadro_data::*;
+
+    #[cfg(feature = "venues")]
+    mod venues;
+    #[cfg(feature = "venues")]
+    pub use venues::{
+        DataRequest, LoadedMarket, MarketError, PerpMarket, Venue, load, load_aggregated,
+        load_many, load_perp,
+    };
+}
 #[doc(inline)]
 pub use akadro_engine as engine;
 #[cfg(feature = "indicators")]

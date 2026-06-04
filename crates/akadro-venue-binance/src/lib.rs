@@ -24,7 +24,7 @@ use core::fmt::Write as _;
 use akadro_core::{
     AccountEvent, AssetId, Bar, CapSet, Capability, ClientOrderId, DataSource, Event, EventSink,
     ExecutionClient, InstrumentCatalog, InstrumentId, InstrumentKind, InstrumentSpec, Money,
-    OrderKind, OrderRequest, Price, Qty, RejectReason, Side, TimeInForce, Timestamp,
+    OrderKind, OrderRequest, PageSink, Price, Qty, RejectReason, Side, TimeInForce, Timestamp,
 };
 use serde::Deserialize;
 
@@ -481,6 +481,8 @@ pub struct BinanceKlineFeed<T> {
     page_delay: std::time::Duration,
     /// Bounded retries on a `429`/`418` (rate-limited) page.
     max_retries: u32,
+    /// Opt-in per-page sink for incremental cache journaling (resumable back-fill).
+    page_sink: Option<Box<dyn PageSink>>,
     buffer: std::collections::VecDeque<Bar>,
     fetched: bool,
 }
@@ -512,9 +514,19 @@ impl<T: Transport> BinanceKlineFeed<T> {
             klines_path: "/api/v3/klines",
             page_delay: std::time::Duration::from_millis(120),
             max_retries: 8,
+            page_sink: None,
             buffer: std::collections::VecDeque::new(),
             fetched: false,
         }
+    }
+
+    /// Install a per-page [`PageSink`] (the cache's incremental journal), handed each
+    /// page of a [`with_range`](Self::with_range) back-fill before it is buffered so
+    /// the download is resumable. The cache layer supplies this; user code does not.
+    #[must_use]
+    pub fn with_page_sink(mut self, sink: Box<dyn PageSink>) -> Self {
+        self.page_sink = Some(sink);
+        self
     }
 
     /// Switch this feed to the USDⓈ-M futures klines path (`/fapi/v1/klines`).
@@ -609,6 +621,9 @@ impl<T: Transport> BinanceKlineFeed<T> {
                 let page = self.fetch_page(Some(cursor), Some(end))?;
                 let Some(last_bar) = page.last() else { break };
                 let last = last_bar.ts.as_nanos() / 1_000_000;
+                if let Some(sink) = self.page_sink.as_mut() {
+                    sink.on_page(&page); // incremental journal before buffering (resumable)
+                }
                 self.buffer.extend(page);
                 if last <= cursor {
                     break;
@@ -630,7 +645,12 @@ impl<T: Transport> DataSource for BinanceKlineFeed<T> {
     fn next_event(&mut self) -> Option<Event> {
         if !self.fetched {
             self.fetched = true;
-            if self.fetch().is_err() {
+            if let Err(e) = self.fetch() {
+                // Truncated download: tell the page-sink so the cache loader does
+                // not record the unfetched remainder as verified-empty (silent loss).
+                if let Some(sink) = self.page_sink.as_mut() {
+                    sink.on_error(&e.to_string());
+                }
                 return None;
             }
         }
@@ -1076,6 +1096,20 @@ mod tests {
                 qty_scale: 5,
             }],
         )
+    }
+
+    #[test]
+    fn debug_hides_secret() {
+        // Credential-hiding regression lock (secret = b"secret" via exec_with).
+        let dbg = format!("{:?}", exec_with(vec![]));
+        assert!(
+            dbg.contains("BinanceSpotExec"),
+            "Debug should still name the type"
+        );
+        assert!(
+            !dbg.contains("secret"),
+            "Debug must not leak the API secret"
+        );
     }
 
     #[test]

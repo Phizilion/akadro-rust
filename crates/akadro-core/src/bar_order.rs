@@ -21,11 +21,12 @@ use crate::Bar;
 
 /// Why a `&[Bar]` slice is not a valid event stream. Carries the offending index
 /// and timestamps for diagnostics.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum BarOrderError {
     /// The bar at `idx` has an earlier timestamp than its predecessor (time went
     /// backward) — the corrupting case.
+    #[error("bar {idx} is out of order: ts {ts} < previous ts {prev_ts}")]
     NotAscending {
         /// Index of the offending bar.
         idx: usize,
@@ -38,6 +39,7 @@ pub enum BarOrderError {
     /// instrument** (a true duplicate). Equal timestamps on *different* instruments
     /// are allowed (a legitimately interleaved multi-instrument timeline) and never
     /// reported here.
+    #[error("bar {idx} duplicates the previous same-instrument timestamp {ts}")]
     DuplicateTimestamp {
         /// Index of the duplicate bar.
         idx: usize,

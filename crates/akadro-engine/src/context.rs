@@ -79,9 +79,9 @@ impl OrderGate {
     fn submit(&mut self, request: OrderRequest) -> ClientOrderId {
         let id = ClientOrderId::new(self.next_id);
         self.next_id += 1;
-        self.submitted.insert(id, PlacedOrder { id, request });
+        self.submitted.insert(id, PlacedOrder::new(id, request));
         self.pending
-            .push(GateAction::Submit(PlacedOrder { id, request }));
+            .push(GateAction::Submit(PlacedOrder::new(id, request)));
         id
     }
 
