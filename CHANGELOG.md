@@ -7,6 +7,18 @@ release.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-04
+
+Headline: the v0.2 line (indicators, analytics, the data cache, the live shell, five
+venue connectors + DEX, the TUI, expanded order/fill realism) plus this release's
+hardening — the data-layer silent-data-loss fix, the `O(log k)` tournament-tree merge,
+the dhat allocation gate, the mdbook lifetime-error guide, and a full adversarial
+quality-audit fix pass (overflow discipline, the `Costs` D13 newtype, `#[non_exhaustive]`
+/ `Error` semver fixes, the `Resync` drain unification, new regression + property tests,
+and an honest coverage gate). **Minor bump (pre-1.0): contains breaking API changes** —
+`Costs` is now an opaque newtype (was a `SmallVec` alias) and `PlacedOrder` is
+`#[non_exhaustive]` (construct via `PlacedOrder::new`).
+
 ### Changed — quality-audit fixes: discipline drift + semver hazards
 From an adversarial quality audit (`audits/RATING_REPORT.md`), all high-priority items resolved
 (parity bit-identical: replay oracle + golden-master + `proptest_parity` re-verified):

@@ -19,6 +19,6 @@ something the compiler hands you, you will get a lifetime error that can look cr
 If that is why you are here, jump straight to **[I got a lifetime error](./lifetime-errors.md)**.
 
 > This book is the human-facing companion to the engineering guide in
-> [`AGENTS.md`](https://github.com/akadro/akadro-rust/blob/main/AGENTS.md) (`§4` covers
+> [`AGENTS.md`](https://github.com/Phizilion/akadro-rust/blob/main/AGENTS.md) (`§4` covers
 > the kill feature in full). The compile-fail proofs that back every claim here live in
 > the `akadro-compile-tests` crate.

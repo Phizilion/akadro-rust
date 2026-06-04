@@ -695,7 +695,16 @@ or blocked on a future subsystem):**
 
 ## 14. Changelog
 
-See `CHANGELOG.md` (keep-a-changelog). Current: `0.1.2` (2026-06-02) — **walk-forward
+See `CHANGELOG.md` (keep-a-changelog). Current: `0.2.0` (2026-06-04) — the v0.2 line
+(indicators, analytics, the Arrow data cache, the live shell, five venue connectors +
+DEX, the TUI, expanded order/fill realism) plus this release's hardening: the data-layer
+silent-data-loss fix (`PageSink::on_error`), the `O(log k)` tournament-tree merge (D15),
+the dhat allocation gate, the mdbook lifetime-error guide (D14), and a full adversarial
+quality-audit fix pass (overflow discipline; the `Costs` opaque newtype keeping `smallvec`
+out of the public API, D13; `#[non_exhaustive]`/`Error` semver fixes; the `Resync` drain
+unification; new regression + property tests; an honest 97% coverage gate). **Minor bump
+(pre-1.0) — breaking: `Costs` is now an opaque newtype and `PlacedOrder` is
+`#[non_exhaustive]` (use `PlacedOrder::new`).** `0.1.2` (2026-06-02) — **walk-forward
 look-ahead & fool-protection** (the structural `WalkForwardBacktest` whose `fit` step
 never sees the OOS slice; `WalkForwardSummary` correct OOS pooling; `from_equity_auto`
 annualization; the IS/OOS-leaking generic runners gated behind `escape-hatch`) and

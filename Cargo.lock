@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "akadro"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "akadro-analytics",
  "akadro-backtest",
@@ -65,7 +65,7 @@ dependencies = [
 
 [[package]]
 name = "akadro-analytics"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "akadro-core",
  "akadro-engine",
@@ -73,7 +73,7 @@ dependencies = [
 
 [[package]]
 name = "akadro-backtest"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "akadro-analytics",
  "akadro-core",
@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "akadro-compile-tests"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "akadro-core",
  "akadro-engine",
@@ -94,7 +94,7 @@ dependencies = [
 
 [[package]]
 name = "akadro-core"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "proptest",
  "serde",
@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "akadro-data"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "akadro-core",
  "arrow-array",
@@ -118,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "akadro-engine"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "akadro-core",
  "criterion",
@@ -133,11 +133,11 @@ dependencies = [
 
 [[package]]
 name = "akadro-indicators"
-version = "0.1.2"
+version = "0.2.0"
 
 [[package]]
 name = "akadro-live"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "akadro-backtest",
  "akadro-core",
@@ -151,7 +151,7 @@ dependencies = [
 
 [[package]]
 name = "akadro-testkit"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "akadro-backtest",
  "akadro-core",
@@ -160,7 +160,7 @@ dependencies = [
 
 [[package]]
 name = "akadro-tui"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "akadro-core",
  "akadro-engine",
@@ -169,7 +169,7 @@ dependencies = [
 
 [[package]]
 name = "akadro-venue-binance"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "akadro-backtest",
  "akadro-core",
@@ -188,7 +188,7 @@ dependencies = [
 
 [[package]]
 name = "akadro-venue-bybit"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "akadro-core",
  "akadro-engine",
@@ -204,14 +204,14 @@ dependencies = [
 
 [[package]]
 name = "akadro-venue-dex"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "akadro-core",
 ]
 
 [[package]]
 name = "akadro-venue-kucoin"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "akadro-core",
  "akadro-engine",
@@ -227,7 +227,7 @@ dependencies = [
 
 [[package]]
 name = "akadro-venue-mexc"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "akadro-core",
  "akadro-engine",
@@ -243,7 +243,7 @@ dependencies = [
 
 [[package]]
 name = "akadro-venue-okx"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "akadro-backtest",
  "akadro-core",
@@ -1614,7 +1614,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "playground"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "akadro",
 ]
@@ -2256,7 +2256,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "sma-crossover"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "akadro-backtest",
  "akadro-core",
