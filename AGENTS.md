@@ -374,9 +374,6 @@ akadro-rust/
 (The k-way-merge perf bench lives at `crates/akadro-engine/benches/merge.rs` — a real
 CI perf gate now, not a stub: the tournament-tree merge vs the `BinaryHeap` baseline.)
 
-`~/.cargo/config.toml` on the dev host caps `build.jobs = 4` (host-specific, NOT
-in the repo) — use ≤4 cores for compiling here.
-
 ---
 
 ## 9. Dependencies & rationale
@@ -782,7 +779,7 @@ How to use this doc: **skim the Golden Rules every session** — they are the si
 32. Validate at construction and fail fast: `Result`/`Option` for externally-sourced input, `debug_assert` for upstream-contract invariants; never silently coerce bad input. [#6]
 33. Give every growable public type both `#[non_exhaustive]` and a `::new` constructor; wrap foreign errors as owned `String` (never `#[from]`-leak); keep no foreign types in public signatures (D13: `CapSet`, `EventSink`, no `Index`). [#6]
 34. Treat the production-ready gate as mandatory and observed: `test` green, `clippy --all-targets --all-features` zero warnings, `fmt --check`, `doc --all-features -D warnings`, coverage, trade-oracle, live-schema — never "should pass". [#7][#8]
-35. Invoke cargo as `PATH=/home/admin/.cargo/bin:$PATH cargo +1.95.0 ...` (absolute paths, prepend PATH every call); the system `/usr/sbin/cargo` ignores `+toolchain` and the `.stderr` snapshots are pinned to 1.95. [#8]
+35. Invoke cargo with an explicit `+1.95.0` toolchain (the MSRV and the toolchain the trybuild `.stderr` snapshots are pinned to); a mismatched toolchain rewords the diagnostics and fails the snapshots. [#8]
 36. A "hung" cargo is almost always an orphaned runaway test binary at ~100% CPU (suspect an accidental O(n²)/infinite loop in the code under test); diagnose with `ps` and `kill -9` the PID — `pkill cargo` won't reap it. [#8]
 37. Region (98%) is the coverage gate, line (99%) is aspirational; never game the metric (no assertion-free tests, no lowering the gate, no deleting guards) — cover every exercisable branch and itemize the genuinely-untestable in §10. Update stale coverage numbers instead of letting them rot. [#7][#9]
 38. Run reviews adversarially and at scale: split the attack by goal, run a per-finding verifier that defaults to "refuted," benchmark conventions against reference implementations, and write down why a disproportionate fix is deferred rather than half-implementing it. [#9]
@@ -1650,7 +1647,7 @@ cargo doc --all-features -D warnings         # 4. no broken intra-doc links
 # 7. any GUESSED venue schema verified against the LIVE API, not just a fixture
 ```
 
-Toolchain is pinned: `cargo +1.95.0` with `PATH=/home/admin/.cargo/bin:$PATH` (the `rustup`/`cargo` shims are **not** on the default shell PATH; `/usr/sbin/cargo` is Arch's and does not understand `+toolchain`). The 1.95 pin matters because the trybuild `.stderr` snapshots are toolchain-pinned to it.
+Toolchain is pinned: invoke `cargo +1.95.0`. The 1.95 pin matters because the trybuild `.stderr` snapshots are toolchain-pinned to it.
 
 **Rule for step 7 (live-schema):** a fixture is *not* proof a schema is right — a KuCoin fixture once matched a *wrong* hand-guessed schema and passed (`akadro-connector-owns-io`). When you guess an external venue schema, verify against the live API before calling it done.
 
@@ -1743,29 +1740,19 @@ let path = tmp("empty_source");  // distinct from every other test's name
 
 ### 8. Build, toolchain, CI & operational gotchas
 
-This repo has **no `rust-toolchain.toml`** (confirmed: `ls rust-toolchain*` → no matches), so the toolchain is *never* implied — you must name it on every invocation. The dev host's PATH and `cargo` shim are both traps. Internalize the canonical invocation below before running anything.
+This repo has **no `rust-toolchain.toml`** (confirmed: `ls rust-toolchain*` → no matches), so the toolchain is *never* implied — you must name it on every invocation.
 
-#### Always invoke cargo via the rustup shim with an explicit toolchain
+#### Always invoke cargo with an explicit toolchain
 
-On this host `which -a cargo` resolves to `/usr/sbin/cargo` (Arch's **system** cargo) *before* `~/.cargo/bin`. The rustup shim is at `/home/admin/.cargo/bin/cargo` (a symlink to `rustup`), and `~/.cargo/bin` is **not** on the default shell PATH.
+Name `+1.95.0` on every cargo call: that is the MSRV (`rust-version = "1.95"`, root `Cargo.toml:32`) **and** the toolchain the trybuild `.stderr` snapshots are pinned to (CI `test` matrix is `["1.95.0", "stable"]`, `ci.yml:41`). A different toolchain rewords the diagnostics and fails the snapshots.
 
-- **BAD** — picks up `/usr/sbin/cargo`, which does not understand `+toolchain` syntax and errors (or silently runs the wrong rustc):
-  ```sh
-  cargo +1.95.0 test --workspace          # error: no such subcommand / +toolchain not understood
-  ```
-- **GOOD** — prepend the rustup bin dir, name the MSRV explicitly:
-  ```sh
-  PATH=/home/admin/.cargo/bin:$PATH cargo +1.95.0 test --workspace
-  ```
-  Use `+1.95.0` because that is the MSRV (`rust-version = "1.95"`, root `Cargo.toml:32`) **and** the toolchain the trybuild `.stderr` snapshots are pinned to (CI `test` matrix is `["1.95.0", "stable"]`, `ci.yml:41`). Agent threads reset cwd between bash calls — always use absolute paths and prepend the PATH in *every* command (shell state does not persist).
-
-#### Cap parallelism at ≤4 cores — it is host config, not repo config
-
-`~/.cargo/config.toml` on this host sets `[build] jobs = 4` (confirmed). This is **host-specific and NOT in the repo**, so it will not travel with a clone and a future agent on another host has no such cap. When you add a parallel command (e.g. `cargo test -j`, `nextest`, a build script that spawns), do not exceed 4 cores here. Do **not** "fix" the missing cap by committing a `config.toml` to the repo — it is deliberately host-local.
+```sh
+cargo +1.95.0 test --workspace
+```
 
 #### A "hung" cargo is almost always an orphaned runaway test binary — kill by PID, never just retry
 
-Cargo on this host is fast (`cargo build -p akadro-core` ≈ 0.43s). A `cargo test` "stuck for 20+ minutes" is essentially never a slow compile — it is a `<crate>-<hash>` **test binary infinite-looping / running O(n²) code at ~100% CPU**. Those binaries are orphaned children that **survive `kill cargo` / `TaskStop` / `pkill cargo`**, accumulate across retries, and starve the CPU so every *later* cargo command also crawls.
+A `cargo test` "stuck for 20+ minutes" is essentially never a slow compile — it is a `<crate>-<hash>` **test binary infinite-looping / running O(n²) code at ~100% CPU**. Those binaries are orphaned children that **survive `kill cargo` / `TaskStop` / `pkill cargo`**, accumulate across retries, and starve the CPU so every *later* cargo command also crawls.
 
 - **BAD:** Ctrl-C the cargo invocation and re-run `cargo test` again. The orphan is still pegging a core; you now have two.
 - **GOOD:** diagnose, then kill the actual binary PIDs:
@@ -1780,8 +1767,8 @@ Cargo on this host is fast (`cargo build -p akadro-core` ≈ 0.43s). A `cargo te
 
 CI's `docs` job sets `RUSTDOCFLAGS: -D warnings` and runs `cargo doc --workspace --no-deps --all-features` (`ci.yml:56-65`). The WS-driver modules are **feature-gated** — `akadro-live/src/lib.rs:35-38` (`pub mod binance` behind `binance`, `pub mod mexc` behind `mexc`) and `akadro-venue-mexc/src/lib.rs:39` (`#[cfg(feature = "net")]`). A default-feature `cargo doc` never compiles those modules, so a broken `[intra-doc-link]` or redundant-explicit-link inside them is invisible locally but fails the `-D warnings` gate in CI.
 
-- **BAD** (passes locally, fails CI): `PATH=/home/admin/.cargo/bin:$PATH cargo +1.95.0 doc --workspace --no-deps`
-- **GOOD** (matches CI): `RUSTDOCFLAGS="-D warnings" PATH=/home/admin/.cargo/bin:$PATH cargo +1.95.0 doc --workspace --no-deps --all-features`
+- **BAD** (passes locally, fails CI): `cargo +1.95.0 doc --workspace --no-deps`
+- **GOOD** (matches CI): `RUSTDOCFLAGS="-D warnings" cargo +1.95.0 doc --workspace --no-deps --all-features`
 
 #### Struct-doc method links need the `Self::` qualifier
 
@@ -1807,12 +1794,12 @@ The `# ` prefix hides the line from rendered docs; the `{ }` scopes the cfg. Wit
 
 `rustfmt.toml` pins `edition = "2024"` + `max_width = 100`. CI's first job is `cargo fmt --all --check` (`ci.yml:13-21`), a hard fail. Hand-written multi-line money math (`i128` widening, `try_from`, chained `notional`) drifts from rustfmt's preferred wrapping, so a change that "looks formatted" still fails `--check`.
 
-- **GOOD:** `PATH=/home/admin/.cargo/bin:$PATH cargo +1.95.0 fmt --all` (mutate) before `cargo fmt --all --check` (verify). Never hand-format; let rustfmt own line wrapping.
+- **GOOD:** `cargo +1.95.0 fmt --all` (mutate) before `cargo fmt --all --check` (verify). Never hand-format; let rustfmt own line wrapping.
 
 #### trybuild `.stderr` is pinned to rustc 1.95 — a toolchain bump means TRYBUILD=overwrite
 
 The 27 compile-fail `.stderr` snapshots in `akadro-compile-tests` capture exact diagnostic wording, which changes between rustc versions. CI only asserts them on the 1.95.0 matrix leg and **excludes** them on stable (`ci.yml:48-54`: `--exclude akadro-compile-tests` on non-1.95). So:
-- Run/regenerate snapshots **only** under `+1.95.0`. Regenerate after an intentional toolchain bump or API loosening: `TRYBUILD=overwrite PATH=/home/admin/.cargo/bin:$PATH cargo +1.95.0 test -p akadro-compile-tests`, then **diff the new `.stderr` by eye** — an unexpected change there can mean the kill-feature guarantee silently weakened, not just reworded diagnostics.
+- Run/regenerate snapshots **only** under `+1.95.0`. Regenerate after an intentional toolchain bump or API loosening: `TRYBUILD=overwrite cargo +1.95.0 test -p akadro-compile-tests`, then **diff the new `.stderr` by eye** — an unexpected change there can mean the kill-feature guarantee silently weakened, not just reworded diagnostics.
 
 #### Build-profile gotchas (root `Cargo.toml:130-139`)
 
@@ -1839,11 +1826,11 @@ The `coverage` job runs `cargo llvm-cov --workspace --all-features` then `report
 #### Run the full local gate before declaring done (closed-loop)
 
 ```sh
-P=/home/admin/.cargo/bin; TC=+1.95.0
-PATH=$P:$PATH cargo $TC test --workspace
-PATH=$P:$PATH cargo $TC clippy --workspace --all-targets --all-features    # 0 warnings
-PATH=$P:$PATH cargo $TC fmt --all --check
-RUSTDOCFLAGS="-D warnings" PATH=$P:$PATH cargo $TC doc --workspace --no-deps --all-features
+TC=+1.95.0
+cargo $TC test --workspace
+cargo $TC clippy --workspace --all-targets --all-features    # 0 warnings
+cargo $TC fmt --all --check
+RUSTDOCFLAGS="-D warnings" cargo $TC doc --workspace --no-deps --all-features
 ```
 On any trade-sim/engine change also run the replay trade-oracle + parity golden-master. The four CI gates that bite hardest in this order — **fmt drift → clippy pedantic → feature-gated doc-link/doctest under `--all-features` → trybuild on 1.95** — are exactly the ones invisible to a casual `cargo test` on default features.
 
