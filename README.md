@@ -6,15 +6,6 @@ guarantee against look-ahead, and strict backtest↔live parity.**
 [![license](https://img.shields.io/badge/license-MPL--2.0-blue)](#license)
 [![rust](https://img.shields.io/badge/rust-1.95%2B-orange)](#)
 
-> Status: **v0.2.0**, intended for use as a dependency in other
-> projects. The look-ahead kill feature, the backtest↔live parity golden-master,
-> **five REST venue connectors** (MEXC spot+futures, OKX, Binance, Bybit, KuCoin —
-> each with historical back-fill, rate-limit pacing, and paged funding history),
-> indicators, analytics, the columnar data cache, and the live/paper shell are all
-> implemented and tested. See
-> [`INSTALL.md`](INSTALL.md) to add it to a project, and [`AGENTS.md`](AGENTS.md)
-> for the full design and the explicitly-tracked open items.
-
 ## Why akadro
 
 - **You can't accidentally read the future.** During a backtest, reading
